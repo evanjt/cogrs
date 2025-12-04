@@ -1,9 +1,12 @@
 [package]
 name = "geocog"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
-description = "Pure Rust COG (Cloud Optimized GeoTIFF) reader library"
+description = "Tools for creating COG-based tilers"
 license = "MIT"
+repository = "https://github.com/evanjt/geocog"
+documentation = "https://docs.rs/geocog"
+homepage = "https://github.com/evanjt/geocog"
 readme = "README.md"
 keywords = ["cog", "geotiff", "tiff", "raster", "geo"]
 categories = ["science::geo", "encoding"]
