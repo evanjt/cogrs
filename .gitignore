@@ -1,0 +1,9 @@
+/target
+/data
+/ignore
+*.md
+*.tif
+*.tiff
+*.png
+*.bak
+.garage/
