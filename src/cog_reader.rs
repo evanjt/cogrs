@@ -286,6 +286,58 @@ impl OverviewMetadata {
     }
 }
 
+/// Hint for pre-computed overview quality analysis
+///
+/// This allows callers to skip the expensive runtime analysis by providing
+/// a pre-computed value (e.g., from a database).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OverviewQualityHint {
+    /// Compute at runtime (default behavior) - samples tiles to determine quality
+    ComputeAtRuntime,
+    /// All overviews have sufficient data density
+    AllUsable,
+    /// No overviews have sufficient data - always use full resolution
+    NoneUsable,
+    /// Use overviews 0..=n (where n is the minimum usable overview index)
+    MinUsable(usize),
+}
+
+impl Default for OverviewQualityHint {
+    fn default() -> Self {
+        Self::ComputeAtRuntime
+    }
+}
+
+impl OverviewQualityHint {
+    /// Convert from database representation (Option<i32>)
+    ///
+    /// - `None` -> ComputeAtRuntime (legacy layers without pre-computed value)
+    /// - `Some(-1)` -> NoneUsable (force full resolution)
+    /// - `Some(-2)` -> AllUsable (all overviews are good)
+    /// - `Some(n)` where n >= 0 -> MinUsable(n as usize)
+    #[must_use]
+    pub fn from_db_value(value: Option<i32>) -> Self {
+        match value {
+            None => Self::ComputeAtRuntime,
+            Some(-1) => Self::NoneUsable,
+            Some(-2) => Self::AllUsable,
+            Some(n) if n >= 0 => Self::MinUsable(n as usize),
+            Some(_) => Self::ComputeAtRuntime, // Invalid value, fall back to runtime
+        }
+    }
+
+    /// Convert to database representation (Option<i32>)
+    #[must_use]
+    pub fn to_db_value(&self) -> Option<i32> {
+        match self {
+            Self::ComputeAtRuntime => None,
+            Self::NoneUsable => Some(-1),
+            Self::AllUsable => Some(-2),
+            Self::MinUsable(n) => Some(*n as i32),
+        }
+    }
+}
+
 /// COG Reader - efficient COG access with range requests
 pub struct CogReader {
     reader: Arc<dyn RangeReader>,
@@ -304,8 +356,33 @@ impl CogReader {
         Self::from_reader(reader)
     }
 
+    /// Open a COG with a pre-computed overview quality hint
+    ///
+    /// Use this when you have pre-computed the overview quality (e.g., stored in a database)
+    /// to skip the expensive runtime analysis that samples tiles.
+    pub fn open_with_hint(source: &str, hint: OverviewQualityHint) -> AnyResult<Self> {
+        let reader = create_range_reader(source)?;
+        Self::from_reader_with_hint(reader, hint)
+    }
+
     /// Open from an existing range reader
     pub fn from_reader(reader: Arc<dyn RangeReader>) -> AnyResult<Self> {
+        Self::from_reader_with_hint(reader, OverviewQualityHint::ComputeAtRuntime)
+    }
+
+    /// Open from an existing range reader with a pre-computed overview quality hint
+    ///
+    /// This is the preferred method when you have overview quality metadata stored
+    /// in a database, as it avoids the 100-200ms latency from runtime analysis.
+    ///
+    /// # Arguments
+    /// * `reader` - The range reader for accessing the COG data
+    /// * `hint` - Pre-computed overview quality hint:
+    ///   - `ComputeAtRuntime`: Analyze overviews at construction (default, ~100-200ms)
+    ///   - `AllUsable`: All overviews have sufficient data
+    ///   - `NoneUsable`: No overviews are usable, always use full resolution
+    ///   - `MinUsable(n)`: Overviews 0..=n are usable
+    pub fn from_reader_with_hint(reader: Arc<dyn RangeReader>, hint: OverviewQualityHint) -> AnyResult<Self> {
         // Read header to get IFD offset and byte order
         let header_bytes = reader.read_range(0, 8)?;
 
@@ -368,24 +445,76 @@ impl CogReader {
             }
         }
 
+        // Apply the overview quality hint
+        let min_usable_overview = match hint {
+            OverviewQualityHint::AllUsable => None, // None means all are usable
+            OverviewQualityHint::NoneUsable => {
+                // Force full resolution by setting min_usable to beyond any valid index
+                // This triggers the fallback in best_overview_for_resolution
+                Some(usize::MAX)
+            }
+            OverviewQualityHint::MinUsable(n) => Some(n),
+            OverviewQualityHint::ComputeAtRuntime => {
+                // Will be computed below
+                None
+            }
+        };
+
         let mut cog_reader = Self {
             reader,
             metadata,
             overviews,
-            min_usable_overview: None,
+            min_usable_overview,
         };
 
-        // Analyze overview quality to find minimum usable level
-        cog_reader.analyze_overview_quality();
+        // Only analyze at runtime if hint says to compute
+        if matches!(hint, OverviewQualityHint::ComputeAtRuntime) {
+            cog_reader.analyze_overview_quality();
+        }
 
         Ok(cog_reader)
     }
 
     /// Analyze overview quality by sampling tiles to find valid data density
-    /// This determines which overviews have enough data to be useful
-    fn analyze_overview_quality(&mut self) {
+    /// This determines which overviews have enough data to be useful.
+    ///
+    /// This method is expensive (~100-200ms for S3) because it samples tiles.
+    /// Consider using `from_reader_with_hint()` with a pre-computed value instead.
+    ///
+    /// Returns the result as an `OverviewQualityHint` that can be stored in a database.
+    #[must_use]
+    pub fn compute_overview_quality_hint(&self) -> OverviewQualityHint {
         if self.overviews.is_empty() {
-            return;
+            return OverviewQualityHint::AllUsable;
+        }
+
+        // Run the analysis logic without mutating self
+        let result = self.analyze_overview_quality_impl();
+
+        match result {
+            None => {
+                // No good overview found - check if we have any overviews at all
+                // If we do, it means none are usable
+                if self.overviews.is_empty() {
+                    OverviewQualityHint::AllUsable
+                } else {
+                    OverviewQualityHint::NoneUsable
+                }
+            }
+            Some(idx) => OverviewQualityHint::MinUsable(idx),
+        }
+    }
+
+    /// Internal: Run overview analysis and set min_usable_overview
+    fn analyze_overview_quality(&mut self) {
+        self.min_usable_overview = self.analyze_overview_quality_impl();
+    }
+
+    /// Internal implementation of overview quality analysis
+    /// Returns None if all overviews are too sparse, Some(n) for minimum usable index
+    fn analyze_overview_quality_impl(&self) -> Option<usize> {
+        if self.overviews.is_empty() {
+            return None;
         }
 
         // For each overview (from smallest/coarsest to largest/finest), check if it has enough data
@@ -396,9 +525,6 @@ impl CogReader {
         // The trade-off is that sparse datasets will read more tiles at low zoom, but the visual
         // quality improvement is dramatic (see barley crop data as example).
         let min_density_threshold = 0.05; // 5% - require good data density for visual quality
-
-        let mut last_good_overview: Option<usize> = None;
-        let mut overview_densities: Vec<(usize, f64)> = Vec::new();
 
         // Iterate from smallest overview (highest index, coarsest) to largest (index 0, finest)
         for (idx, ovr) in self.overviews.iter().enumerate().rev() {
@@ -427,17 +553,14 @@ impl CogReader {
                 0.0
             };
 
-            overview_densities.push((idx, density));
-
             if density >= min_density_threshold {
-                last_good_overview = Some(idx);
-                break; // Found a good overview, don't need to check higher resolution ones
+                // Found a good overview, return it as the minimum usable
+                return Some(idx);
             }
         }
 
-        // If we found a good overview, set it as the minimum usable
-        // All overviews with index > last_good_overview are too sparse
-        self.min_usable_overview = last_good_overview;
+        // No good overview found - all are too sparse
+        None
     }
 
     /// Find the best overview level for a given source extent size

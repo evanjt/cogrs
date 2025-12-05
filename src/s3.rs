@@ -41,7 +41,9 @@ use object_store::path::Path as ObjectPath;
 use object_store::{GetOptions, GetRange, ObjectStore};
 use std::ops::Range;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::runtime::Handle;
+use tracing::debug;
 
 /// S3 configuration for connecting to S3-compatible storage
 #[derive(Debug, Clone)]
@@ -192,20 +194,32 @@ impl S3RangeReaderAsync {
 
     /// Read a range of bytes asynchronously
     pub async fn read_range_async(&self, offset: u64, length: usize) -> AnyResult<Vec<u8>> {
+        let start_time = Instant::now();
         let range = Range {
             start: offset,
             end: offset + length as u64,
         };
 
         let options = GetOptions {
-            range: Some(GetRange::Bounded(range)),
+            range: Some(GetRange::Bounded(range.clone())),
             ..Default::default()
         };
 
         let result = self.store.get_opts(&self.path, options).await?;
         let bytes = result.bytes().await?;
+        let bytes_vec = bytes.to_vec();
+        let elapsed_ms = start_time.elapsed().as_millis() as u64;
 
-        Ok(bytes.to_vec())
+        debug!(
+            url = %self.url,
+            range_start = offset,
+            range_end = offset + length as u64,
+            bytes_downloaded = bytes_vec.len(),
+            elapsed_ms,
+            "cogrs: S3 range request completed"
+        );
+
+        Ok(bytes_vec)
     }
 
     /// Get the file size
