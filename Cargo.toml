@@ -12,7 +12,7 @@ keywords = ["cog", "geotiff", "tiff", "raster", "geo"]
 categories = ["science::geo", "encoding"]
 
 [lib]
-name = "geocog"
+name = "cogrs"
 path = "src/lib.rs"
 
 [dependencies]
