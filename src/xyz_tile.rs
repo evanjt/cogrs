@@ -111,41 +111,156 @@ impl TransformStrategy {
     }
 }
 
-/// Coordinate transformer using proj4rs (pure Rust)
+/// Coordinate transformer using proj4rs (pure Rust).
+///
+/// This struct provides efficient, reusable coordinate transformations between
+/// any two coordinate reference systems (CRS) identified by EPSG codes.
+///
+/// # Example
+///
+/// ```rust,ignore
+/// use cogrs::CoordTransformer;
+///
+/// // Create a transformer from WGS84 to UTM zone 33N
+/// let transformer = CoordTransformer::new(4326, 32633)?;
+/// let (utm_x, utm_y) = transformer.transform(15.0, 52.0)?;
+///
+/// // Or use convenience constructors
+/// let to_mercator = CoordTransformer::from_lonlat_to(3857)?;
+/// let from_mercator = CoordTransformer::to_lonlat_from(3857)?;
+/// ```
 pub struct CoordTransformer {
     source_proj: Proj,
     target_proj: Proj,
+    /// EPSG code of the source CRS
+    source_epsg: i32,
+    /// EPSG code of the target CRS
+    target_epsg: i32,
     /// True if source uses degrees (needs radian conversion)
-    #[allow(dead_code)]
     source_is_geographic: bool,
     /// True if target uses degrees (needs radian conversion)
     target_is_geographic: bool,
 }
 
+impl std::fmt::Debug for CoordTransformer {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CoordTransformer")
+            .field("source_epsg", &self.source_epsg)
+            .field("target_epsg", &self.target_epsg)
+            .field("source_is_geographic", &self.source_is_geographic)
+            .field("target_is_geographic", &self.target_is_geographic)
+            .finish_non_exhaustive()
+    }
+}
+
 impl CoordTransformer {
-    /// Create a transformer from EPSG:3857 (Web Mercator) to another CRS
-    pub fn from_3857_to(target_epsg: u32) -> Result<Self, String> {
-        let source_str = get_proj_string(3857)
-            .ok_or("EPSG:3857 not supported")?;
-        let target_str = get_proj_string(target_epsg as i32)
+    /// Create a transformer between any two CRS codes.
+    ///
+    /// # Arguments
+    /// * `source_epsg` - EPSG code of the source coordinate system
+    /// * `target_epsg` - EPSG code of the target coordinate system
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// // Transform from WGS84 (lon/lat) to UTM zone 10N
+    /// let transformer = CoordTransformer::new(4326, 32610)?;
+    /// let (utm_x, utm_y) = transformer.transform(-122.4, 37.8)?;
+    /// ```
+    pub fn new(source_epsg: i32, target_epsg: i32) -> Result<Self, String> {
+        let source_str = get_proj_string(source_epsg)
+            .ok_or_else(|| format!("EPSG:{} not supported", source_epsg))?;
+        let target_str = get_proj_string(target_epsg)
             .ok_or_else(|| format!("EPSG:{} not supported", target_epsg))?;
 
         let source_proj = Proj::from_proj_string(source_str)
-            .map_err(|e| format!("Invalid source projection: {:?}", e))?;
+            .map_err(|e| format!("Invalid source projection EPSG:{}: {:?}", source_epsg, e))?;
         let target_proj = Proj::from_proj_string(target_str)
-            .map_err(|e| format!("Invalid target projection: {:?}", e))?;
+            .map_err(|e| format!("Invalid target projection EPSG:{}: {:?}", target_epsg, e))?;
 
         Ok(Self {
             source_proj,
             target_proj,
-            source_is_geographic: false, // 3857 is projected (meters)
-            target_is_geographic: is_geographic_crs(target_epsg as i32),
+            source_epsg,
+            target_epsg,
+            source_is_geographic: is_geographic_crs(source_epsg),
+            target_is_geographic: is_geographic_crs(target_epsg),
         })
     }
 
-    /// Transform coordinates from source CRS to target CRS
+    /// Create a transformer from EPSG:3857 (Web Mercator) to another CRS.
+    ///
+    /// This is a convenience method for the common case of transforming
+    /// from Web Mercator tile coordinates to a source CRS.
+    pub fn from_3857_to(target_epsg: u32) -> Result<Self, String> {
+        Self::new(3857, target_epsg as i32)
+    }
+
+    /// Create a transformer from EPSG:4326 (WGS84 lon/lat) to another CRS.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let transformer = CoordTransformer::from_lonlat_to(32633)?; // To UTM 33N
+    /// let (x, y) = transformer.transform(15.0, 52.0)?;
+    /// ```
+    pub fn from_lonlat_to(target_epsg: i32) -> Result<Self, String> {
+        Self::new(4326, target_epsg)
+    }
+
+    /// Create a transformer from another CRS to EPSG:4326 (WGS84 lon/lat).
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let transformer = CoordTransformer::to_lonlat_from(32633)?; // From UTM 33N
+    /// let (lon, lat) = transformer.transform(500000.0, 5761000.0)?;
+    /// ```
+    pub fn to_lonlat_from(source_epsg: i32) -> Result<Self, String> {
+        Self::new(source_epsg, 4326)
+    }
+
+    /// Create a transformer from another CRS to EPSG:3857 (Web Mercator).
+    pub fn to_3857_from(source_epsg: i32) -> Result<Self, String> {
+        Self::new(source_epsg, 3857)
+    }
+
+    /// Get the source EPSG code.
+    #[must_use]
+    pub fn source_epsg(&self) -> i32 {
+        self.source_epsg
+    }
+
+    /// Get the target EPSG code.
+    #[must_use]
+    pub fn target_epsg(&self) -> i32 {
+        self.target_epsg
+    }
+
+    /// Check if source CRS is geographic (uses degrees).
+    #[must_use]
+    pub fn source_is_geographic(&self) -> bool {
+        self.source_is_geographic
+    }
+
+    /// Check if target CRS is geographic (uses degrees).
+    #[must_use]
+    pub fn target_is_geographic(&self) -> bool {
+        self.target_is_geographic
+    }
+
+    /// Transform coordinates from source CRS to target CRS.
+    ///
+    /// Handles radian/degree conversion automatically based on CRS types.
     pub fn transform(&self, x: f64, y: f64) -> Result<(f64, f64), String> {
-        let mut point = (x, y, 0.0);
+        // Convert to radians if source is geographic
+        let (in_x, in_y) = if self.source_is_geographic {
+            (x.to_radians(), y.to_radians())
+        } else {
+            (x, y)
+        };
+
+        let mut point = (in_x, in_y, 0.0);
 
         transform(&self.source_proj, &self.target_proj, &mut point)
             .map_err(|e| format!("Transform failed: {:?}", e))?;
@@ -158,6 +273,13 @@ impl CoordTransformer {
         };
 
         Ok((out_x, out_y))
+    }
+
+    /// Transform a batch of coordinates for efficiency.
+    ///
+    /// Returns a Vec of results, one for each input point.
+    pub fn transform_batch(&self, points: &[(f64, f64)]) -> Vec<Result<(f64, f64), String>> {
+        points.iter().map(|&(x, y)| self.transform(x, y)).collect()
     }
 }
 
@@ -524,6 +646,85 @@ mod tests {
         let source_epsg: u32 = 3857;
         let use_identity = source_epsg == 3857;
         assert!(use_identity);
+    }
+
+    #[test]
+    fn test_coord_transformer_new() {
+        // Test the general constructor
+        let transformer = CoordTransformer::new(4326, 3857).unwrap();
+        assert_eq!(transformer.source_epsg(), 4326);
+        assert_eq!(transformer.target_epsg(), 3857);
+        assert!(transformer.source_is_geographic());
+        assert!(!transformer.target_is_geographic());
+    }
+
+    #[test]
+    fn test_coord_transformer_from_lonlat_to() {
+        let transformer = CoordTransformer::from_lonlat_to(3857).unwrap();
+        assert_eq!(transformer.source_epsg(), 4326);
+        assert_eq!(transformer.target_epsg(), 3857);
+
+        // Transform origin
+        let (x, y) = transformer.transform(0.0, 0.0).unwrap();
+        assert!(x.abs() < 1.0);
+        assert!(y.abs() < 1.0);
+    }
+
+    #[test]
+    fn test_coord_transformer_to_lonlat_from() {
+        let transformer = CoordTransformer::to_lonlat_from(3857).unwrap();
+        assert_eq!(transformer.source_epsg(), 3857);
+        assert_eq!(transformer.target_epsg(), 4326);
+
+        // Transform origin
+        let (lon, lat) = transformer.transform(0.0, 0.0).unwrap();
+        assert!(lon.abs() < 0.0001);
+        assert!(lat.abs() < 0.0001);
+    }
+
+    #[test]
+    fn test_coord_transformer_roundtrip() {
+        let to_utm = CoordTransformer::new(4326, 32633).unwrap(); // WGS84 -> UTM 33N
+        let from_utm = CoordTransformer::new(32633, 4326).unwrap(); // UTM 33N -> WGS84
+
+        let lon = 15.0;
+        let lat = 52.0;
+
+        let (x, y) = to_utm.transform(lon, lat).unwrap();
+        let (lon2, lat2) = from_utm.transform(x, y).unwrap();
+
+        assert!((lon - lon2).abs() < 1e-5, "lon roundtrip: {} -> {}", lon, lon2);
+        assert!((lat - lat2).abs() < 1e-5, "lat roundtrip: {} -> {}", lat, lat2);
+    }
+
+    #[test]
+    fn test_coord_transformer_batch() {
+        let transformer = CoordTransformer::new(4326, 3857).unwrap();
+
+        let points = vec![
+            (0.0, 0.0),
+            (10.0, 51.5),
+            (-122.4, 37.8),
+        ];
+
+        let results = transformer.transform_batch(&points);
+
+        assert_eq!(results.len(), 3);
+        assert!(results[0].is_ok());
+        assert!(results[1].is_ok());
+        assert!(results[2].is_ok());
+
+        // Origin should map to origin
+        let (x, y) = results[0].as_ref().unwrap();
+        assert!(x.abs() < 1.0);
+        assert!(y.abs() < 1.0);
+    }
+
+    #[test]
+    fn test_coord_transformer_unsupported_epsg() {
+        let result = CoordTransformer::new(4326, 999999);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not supported"));
     }
 }
 
