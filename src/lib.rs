@@ -43,7 +43,6 @@
 // Public modules
 // ============================================================================
 
-pub mod async_tile;
 pub mod cog_reader;
 pub mod geometry;
 pub mod lzw_fallback;
@@ -83,7 +82,7 @@ pub use point_query::{
 };
 
 // ============================================================================
-// XYZ Tile Extraction
+// XYZ Tile Extraction (async)
 // ============================================================================
 
 pub use xyz_tile::{
@@ -96,16 +95,6 @@ pub use xyz_tile::{
     extract_tile_with_extent,
     extract_tile_with_extent_resampled,
     extract_tile_with_bands,
-};
-
-// ============================================================================
-// Async Tile Extraction
-// ============================================================================
-
-pub use async_tile::{
-    AsyncTileExtractor,
-    extract_xyz_tile_async,
-    extract_tile_async,
     extract_xyz_tiles_concurrent,
 };
 

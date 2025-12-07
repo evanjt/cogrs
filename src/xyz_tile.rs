@@ -1,17 +1,31 @@
-//! XYZ tile extraction from COG files
+//! Async XYZ tile extraction from COG files
 //!
-//! This module provides functionality to extract XYZ map tiles from Cloud Optimized GeoTIFFs.
+//! This module provides async functionality to extract XYZ map tiles from Cloud Optimized GeoTIFFs.
 //! It handles coordinate transformations, overview selection, and pixel sampling.
+//! All I/O operations are offloaded to a blocking thread pool to avoid blocking the async runtime.
 //!
 //! # Example
 //!
 //! ```rust,ignore
-//! use cogrs::{CogReader, xyz_tile::{extract_xyz_tile, TileData}};
+//! use cogrs::{CogReader, extract_xyz_tile, TileExtractor};
 //!
-//! let reader = CogReader::open("path/to/cog.tif")?;
-//! let tile = extract_xyz_tile(&reader, 3, 7, 5, (256, 256))?;
-//! // tile.pixels contains f32 pixel values
-//! // tile.bands indicates number of bands (1 for grayscale, 3 for RGB)
+//! #[tokio::main]
+//! async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//!     let reader = CogReader::open("path/to/cog.tif")?;
+//!
+//!     // Simple extraction
+//!     let tile = extract_xyz_tile(&reader, 3, 7, 5, (256, 256)).await?;
+//!
+//!     // Or use the builder for more control
+//!     let tile = TileExtractor::new(&reader)
+//!         .xyz(10, 163, 395)
+//!         .output_size(512, 512)
+//!         .resampling(ResamplingMethod::Bilinear)
+//!         .extract()
+//!         .await?;
+//!
+//!     Ok(())
+//! }
 //! ```
 
 use std::collections::HashSet;
@@ -22,6 +36,7 @@ use proj4rs::transform::transform;
 
 use crate::cog_reader::CogReader;
 use crate::geometry::projection::{get_proj_string, is_geographic_crs};
+use crate::tiff_utils::AnyResult;
 
 // Well-known EPSG codes for coordinate reference systems
 /// Web Mercator (Spherical Mercator) - the standard for XYZ tiles
@@ -474,15 +489,30 @@ impl<'a> TileExtractor<'a> {
         self
     }
 
-    /// Extract the tile with the configured parameters.
+    /// Extract the tile asynchronously with the configured parameters.
+    ///
+    /// This runs tile extraction on a blocking thread pool to avoid blocking
+    /// the async runtime during I/O and decompression operations.
     ///
     /// Returns an error if bounds were not set.
-    pub fn extract(self) -> Result<TileData, Box<dyn std::error::Error + Send + Sync>> {
+    pub async fn extract(self) -> AnyResult<TileData> {
         let bounds = self.bounds.ok_or("Bounds not set: use .xyz() or .bounds()")?;
+        let reader_clone = self.reader.clone_for_async();
+        let resampling = self.resampling;
+        let output_size = self.output_size;
+
         if let Some(selected) = self.selected_bands {
-            extract_tile_with_bands(self.reader, &bounds, self.output_size, self.resampling, &selected)
+            tokio::task::spawn_blocking(move || {
+                extract_tile_with_bands_sync(&reader_clone, &bounds, output_size, resampling, &selected)
+            })
+            .await
+            .map_err(|e| format!("Task join error: {e}"))?
         } else {
-            extract_tile_with_extent_resampled(self.reader, &bounds, self.output_size, self.resampling)
+            tokio::task::spawn_blocking(move || {
+                extract_tile_with_extent_resampled_sync(&reader_clone, &bounds, output_size, resampling)
+            })
+            .await
+            .map_err(|e| format!("Task join error: {e}"))?
         }
     }
 
@@ -508,7 +538,10 @@ impl<'a> TileExtractor<'a> {
     }
 }
 
-/// Extract an XYZ tile from a COG reader
+/// Extract an XYZ tile from a COG reader asynchronously
+///
+/// This runs the tile extraction on a blocking thread pool to avoid blocking
+/// the async runtime during I/O and decompression operations.
 ///
 /// # Arguments
 /// * `reader` - The COG reader with loaded metadata
@@ -519,7 +552,30 @@ impl<'a> TileExtractor<'a> {
 ///
 /// # Returns
 /// `TileData` containing pixel values and band count
-pub fn extract_xyz_tile(
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let tile = extract_xyz_tile(&reader, 10, 163, 395, (256, 256)).await?;
+/// ```
+pub async fn extract_xyz_tile(
+    reader: &CogReader,
+    z: u32,
+    x: u32,
+    y: u32,
+    tile_size: (usize, usize),
+) -> AnyResult<TileData> {
+    let reader_clone = reader.clone_for_async();
+
+    tokio::task::spawn_blocking(move || {
+        extract_xyz_tile_sync(&reader_clone, z, x, y, tile_size)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))?
+}
+
+/// Internal synchronous XYZ tile extraction (used by async wrapper)
+fn extract_xyz_tile_sync(
     reader: &CogReader,
     z: u32,
     x: u32,
@@ -527,29 +583,62 @@ pub fn extract_xyz_tile(
     tile_size: (usize, usize),
 ) -> Result<TileData, Box<dyn std::error::Error + Send + Sync>> {
     let extent_3857 = BoundingBox::from_xyz(z, x, y);
-    extract_tile_with_extent(reader, &extent_3857, tile_size)
+    extract_tile_with_extent_sync(reader, &extent_3857, tile_size)
 }
 
-/// Extract a tile from a COG reader using a Web Mercator bounding box
+/// Extract a tile from a COG reader using a Web Mercator bounding box asynchronously
 ///
 /// This is the main extraction function that handles overview selection,
 /// coordinate transformation, and pixel sampling. Uses nearest neighbor resampling.
-pub fn extract_tile_with_extent(
+pub async fn extract_tile_with_extent(
+    reader: &CogReader,
+    extent_3857: &BoundingBox,
+    tile_size: (usize, usize),
+) -> AnyResult<TileData> {
+    let reader_clone = reader.clone_for_async();
+    let extent = *extent_3857;
+
+    tokio::task::spawn_blocking(move || {
+        extract_tile_with_extent_sync(&reader_clone, &extent, tile_size)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))?
+}
+
+/// Internal synchronous tile extraction (used by async wrapper)
+fn extract_tile_with_extent_sync(
     reader: &CogReader,
     extent_3857: &BoundingBox,
     tile_size: (usize, usize),
 ) -> Result<TileData, Box<dyn std::error::Error + Send + Sync>> {
-    extract_tile_with_extent_resampled(reader, extent_3857, tile_size, ResamplingMethod::Nearest)
+    extract_tile_with_extent_resampled_sync(reader, extent_3857, tile_size, ResamplingMethod::Nearest)
 }
 
-/// Extract a tile from a COG reader with configurable resampling method
+/// Extract a tile from a COG reader with configurable resampling method asynchronously
 ///
 /// # Arguments
 /// * `reader` - The COG reader with loaded metadata
 /// * `extent_3857` - Bounding box in Web Mercator (EPSG:3857)
 /// * `tile_size` - Output tile dimensions (width, height)
 /// * `resampling` - Resampling method to use
-pub fn extract_tile_with_extent_resampled(
+pub async fn extract_tile_with_extent_resampled(
+    reader: &CogReader,
+    extent_3857: &BoundingBox,
+    tile_size: (usize, usize),
+    resampling: ResamplingMethod,
+) -> AnyResult<TileData> {
+    let reader_clone = reader.clone_for_async();
+    let extent = *extent_3857;
+
+    tokio::task::spawn_blocking(move || {
+        extract_tile_with_extent_resampled_sync(&reader_clone, &extent, tile_size, resampling)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))?
+}
+
+/// Internal synchronous tile extraction with resampling (used by async wrapper)
+fn extract_tile_with_extent_resampled_sync(
     reader: &CogReader,
     extent_3857: &BoundingBox,
     tile_size: (usize, usize),
@@ -588,7 +677,7 @@ pub fn extract_tile_with_extent_resampled(
     extract_tile_with_overview(reader, extent_3857, tile_size, overview_idx, strategy, resampling, None)
 }
 
-/// Extract a tile with specific band selection
+/// Extract a tile with specific band selection asynchronously
 ///
 /// # Arguments
 /// * `reader` - The COG reader with loaded metadata
@@ -606,10 +695,29 @@ pub fn extract_tile_with_extent_resampled(
 /// let bbox = BoundingBox::from_xyz(10, 163, 395);
 ///
 /// // Extract only red and blue channels
-/// let tile = extract_tile_with_bands(&reader, &bbox, (256, 256), ResamplingMethod::Nearest, &[0, 2])?;
+/// let tile = extract_tile_with_bands(&reader, &bbox, (256, 256), ResamplingMethod::Nearest, &[0, 2]).await?;
 /// assert_eq!(tile.bands, 2);
 /// ```
-pub fn extract_tile_with_bands(
+pub async fn extract_tile_with_bands(
+    reader: &CogReader,
+    extent_3857: &BoundingBox,
+    tile_size: (usize, usize),
+    resampling: ResamplingMethod,
+    bands: &[usize],
+) -> AnyResult<TileData> {
+    let reader_clone = reader.clone_for_async();
+    let extent = *extent_3857;
+    let bands_vec = bands.to_vec();
+
+    tokio::task::spawn_blocking(move || {
+        extract_tile_with_bands_sync(&reader_clone, &extent, tile_size, resampling, &bands_vec)
+    })
+    .await
+    .map_err(|e| format!("Task join error: {e}"))?
+}
+
+/// Internal synchronous band selection extraction (used by async wrapper)
+fn extract_tile_with_bands_sync(
     reader: &CogReader,
     extent_3857: &BoundingBox,
     tile_size: (usize, usize),
@@ -1000,6 +1108,62 @@ fn extract_tile_with_overview(
     })
 }
 
+/// Extract multiple XYZ tiles concurrently
+///
+/// This extracts multiple tiles in parallel, which can be more efficient than
+/// extracting them sequentially when I/O is the bottleneck.
+///
+/// # Arguments
+/// * `reader` - The COG reader with loaded metadata
+/// * `tiles` - Vector of (z, x, y) tile coordinates
+/// * `tile_size` - Output tile dimensions (width, height)
+///
+/// # Returns
+/// A vector of results in the same order as the input tiles
+///
+/// # Example
+///
+/// ```rust,ignore
+/// let tiles_to_fetch = vec![
+///     (10, 163, 395),
+///     (10, 164, 395),
+///     (10, 163, 396),
+/// ];
+///
+/// let results = extract_xyz_tiles_concurrent(&reader, &tiles_to_fetch, (256, 256)).await;
+/// for (i, result) in results.iter().enumerate() {
+///     match result {
+///         Ok(tile) => println!("Tile {}: {} pixels", i, tile.pixels.len()),
+///         Err(e) => println!("Tile {} failed: {}", i, e),
+///     }
+/// }
+/// ```
+pub async fn extract_xyz_tiles_concurrent(
+    reader: &CogReader,
+    tiles: &[(u32, u32, u32)],
+    tile_size: (usize, usize),
+) -> Vec<AnyResult<TileData>> {
+    use futures::future::join_all;
+
+    let futures: Vec<_> = tiles
+        .iter()
+        .map(|&(z, x, y)| {
+            let reader_clone = reader.clone_for_async();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    extract_xyz_tile_sync(&reader_clone, z, x, y, tile_size)
+                })
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("Task join error: {e}").into()
+                })?
+            }
+        })
+        .collect();
+
+    join_all(futures).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1172,7 +1336,7 @@ mod tests {
 
         // Note: We can't fully test extract_tile_with_bands without a real file,
         // but we can verify the builder stores bands correctly
-        let selected_bands = vec![0, 2];
+        let selected_bands = [0, 2];
         assert_eq!(selected_bands.len(), 2);
         assert_eq!(selected_bands[0], 0);
         assert_eq!(selected_bands[1], 2);
@@ -1210,19 +1374,19 @@ mod global_cog_tests {
     use std::sync::Arc;
     use crate::cog_reader::CogReader;
     use crate::range_reader::LocalRangeReader;
-    
-    #[test]
-    fn test_global_cog_center_tile() {
+
+    #[tokio::test]
+    async fn test_global_cog_center_tile() {
         // Skip if file doesn't exist
         let path = "/home/evan/projects/personal/geo/tileyolo/data/viridis/output_cog.tif";
         if !std::path::Path::new(path).exists() {
             println!("Skipping: test file not found");
             return;
         }
-        
+
         let reader = LocalRangeReader::new(path).unwrap();
         let cog = CogReader::from_reader(Arc::new(reader)).unwrap();
-        
+
         println!("COG metadata:");
         println!("  Width: {}, Height: {}", cog.metadata.width, cog.metadata.height);
         println!("  CRS: {:?}", cog.metadata.crs_code);
@@ -1232,32 +1396,32 @@ mod global_cog_tests {
         if let Some(tiepoint) = &cog.metadata.geo_transform.tiepoint {
             println!("  Tiepoint: {:?}", tiepoint);
         }
-        
+
         // Test tile 1/0/0 - western hemisphere at zoom 1
         let bbox_1_0_0 = BoundingBox::from_xyz(1, 0, 0);
         println!("\nTile 1/0/0 extent (3857): minx={:.0}, maxx={:.0}", bbox_1_0_0.minx, bbox_1_0_0.maxx);
-        
+
         // Transform extent corners to source CRS (4326)
         let transformer = CoordTransformer::from_3857_to(4326).unwrap();
         let (min_lon, min_lat) = transformer.transform(bbox_1_0_0.minx, bbox_1_0_0.miny).unwrap();
         let (max_lon, max_lat) = transformer.transform(bbox_1_0_0.maxx, bbox_1_0_0.maxy).unwrap();
-        println!("Tile 1/0/0 extent (4326): lon=[{:.2}, {:.2}], lat=[{:.2}, {:.2}]", 
+        println!("Tile 1/0/0 extent (4326): lon=[{:.2}, {:.2}], lat=[{:.2}, {:.2}]",
                  min_lon, max_lon, min_lat, max_lat);
-        
-        let tile = extract_xyz_tile(&cog, 1, 0, 0, (256, 256)).unwrap();
-        
+
+        let tile = extract_xyz_tile(&cog, 1, 0, 0, (256, 256)).await.unwrap();
+
         // Count non-zero pixels
         let non_zero = tile.pixels.iter().filter(|&&v| v != 0.0).count();
         let total = tile.pixels.len();
         println!("Tile 1/0/0: {}/{} non-zero pixels ({:.1}%)", non_zero, total, non_zero as f64 / total as f64 * 100.0);
-        
+
         // Test center tile 1/0/1 (should be fully populated for a global map)
         let bbox_1_0_1 = BoundingBox::from_xyz(1, 0, 1);
         let (min_lon, _) = transformer.transform(bbox_1_0_1.minx, bbox_1_0_1.miny).unwrap();
         let (max_lon, _) = transformer.transform(bbox_1_0_1.maxx, bbox_1_0_1.maxy).unwrap();
         println!("\nTile 1/0/1 extent (4326): lon=[{:.2}, {:.2}]", min_lon, max_lon);
-        
-        let tile2 = extract_xyz_tile(&cog, 1, 0, 1, (256, 256)).unwrap();
+
+        let tile2 = extract_xyz_tile(&cog, 1, 0, 1, (256, 256)).await.unwrap();
         let non_zero2 = tile2.pixels.iter().filter(|&&v| v != 0.0).count();
         println!("Tile 1/0/1: {}/{} non-zero pixels ({:.1}%)", non_zero2, tile2.pixels.len(), non_zero2 as f64 / tile2.pixels.len() as f64 * 100.0);
 
@@ -1267,12 +1431,12 @@ mod global_cog_tests {
         let (max_lon, _) = transformer.transform(bbox_1_1_0.maxx, bbox_1_1_0.maxy).unwrap();
         println!("\nTile 1/1/0 extent (4326): lon=[{:.2}, {:.2}]", min_lon, max_lon);
 
-        let tile3 = extract_xyz_tile(&cog, 1, 1, 0, (256, 256)).unwrap();
+        let tile3 = extract_xyz_tile(&cog, 1, 1, 0, (256, 256)).await.unwrap();
         let non_zero3 = tile3.pixels.iter().filter(|&&v| v != 0.0).count();
         println!("Tile 1/1/0: {}/{} non-zero pixels ({:.1}%)", non_zero3, tile3.pixels.len(), non_zero3 as f64 / tile3.pixels.len() as f64 * 100.0);
 
         // Test tile 1/1/1 - eastern southern hemisphere
-        let tile4 = extract_xyz_tile(&cog, 1, 1, 1, (256, 256)).unwrap();
+        let tile4 = extract_xyz_tile(&cog, 1, 1, 1, (256, 256)).await.unwrap();
         let non_zero4 = tile4.pixels.iter().filter(|&&v| v != 0.0).count();
         println!("Tile 1/1/1: {}/{} non-zero pixels ({:.1}%)", non_zero4, tile4.pixels.len(), non_zero4 as f64 / tile4.pixels.len() as f64 * 100.0);
 
@@ -1283,8 +1447,8 @@ mod global_cog_tests {
         assert!(non_zero4 as f64 / tile4.pixels.len() as f64 > 0.99, "Tile 1/1/1 should be nearly full");
     }
 
-    #[test]
-    fn test_band_selection_extraction() {
+    #[tokio::test]
+    async fn test_band_selection_extraction() {
         // Skip if test file doesn't exist
         let path = "/home/evan/projects/personal/geo/tileyolo/data/viridis/output_cog.tif";
         if !std::path::Path::new(path).exists() {
@@ -1304,13 +1468,13 @@ mod global_cog_tests {
         }
 
         // Extract all bands
-        let tile_all = extract_xyz_tile(&cog, 1, 0, 0, (128, 128)).unwrap();
+        let tile_all = extract_xyz_tile(&cog, 1, 0, 0, (128, 128)).await.unwrap();
         assert_eq!(tile_all.bands, num_bands);
         assert_eq!(tile_all.pixels.len(), 128 * 128 * num_bands);
 
         // Extract only the first band
         let bbox = BoundingBox::from_xyz(1, 0, 0);
-        let tile_one = extract_tile_with_bands(&cog, &bbox, (128, 128), ResamplingMethod::Nearest, &[0]).unwrap();
+        let tile_one = extract_tile_with_bands(&cog, &bbox, (128, 128), ResamplingMethod::Nearest, &[0]).await.unwrap();
         assert_eq!(tile_one.bands, 1);
         assert_eq!(tile_one.pixels.len(), 128 * 128);
 
@@ -1320,6 +1484,7 @@ mod global_cog_tests {
             .output_size(128, 128)
             .bands(&[0])
             .extract()
+            .await
             .unwrap();
         assert_eq!(tile_builder.bands, 1);
 
@@ -1332,5 +1497,34 @@ mod global_cog_tests {
         }
 
         println!("Band selection test passed: single band matches first band of all bands");
+    }
+
+    #[tokio::test]
+    async fn test_concurrent_extraction() {
+        let path = "/home/evan/projects/personal/geo/tileyolo/data/viridis/output_cog.tif";
+        if !std::path::Path::new(path).exists() {
+            println!("Skipping: test file not found");
+            return;
+        }
+
+        let reader = LocalRangeReader::new(path).unwrap();
+        let cog = CogReader::from_reader(Arc::new(reader)).unwrap();
+
+        let tiles = vec![
+            (1, 0, 0),
+            (1, 1, 0),
+            (1, 0, 1),
+            (1, 1, 1),
+        ];
+
+        let results = extract_xyz_tiles_concurrent(&cog, &tiles, (256, 256)).await;
+
+        assert_eq!(results.len(), 4);
+        for result in &results {
+            assert!(result.is_ok());
+            let tile = result.as_ref().unwrap();
+            assert_eq!(tile.width, 256);
+            assert_eq!(tile.height, 256);
+        }
     }
 }
