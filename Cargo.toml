@@ -59,3 +59,8 @@ s3 = []
 tempfile = "3.19.1"
 tokio = { version = "1.44.2", features = ["full", "test-util"] }
 rand = "0.9"
+criterion = { version = "0.6", features = ["html_reports"] }
+
+[[bench]]
+name = "tile_extraction"
+harness = false
