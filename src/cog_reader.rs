@@ -1619,6 +1619,76 @@ fn decompress_tile(
     }
 }
 
+/// Reverses TIFF predictor encoding to recover original sample values.
+///
+/// TIFF predictors are a pre-compression step that improves compression ratios by
+/// storing differences between adjacent samples rather than absolute values. This
+/// function reverses (decodes) that transformation after decompression.
+///
+/// # TIFF Predictor Types
+///
+/// - **Predictor 1 (None)**: No prediction, data is stored as-is.
+/// - **Predictor 2 (Horizontal Differencing)**: Each sample stores the difference
+///   from the previous sample in the same row. Decoding requires cumulative addition.
+/// - **Predictor 3 (Floating Point)**: Specialized for IEEE floating-point data;
+///   differences are computed per byte position across samples.
+///
+/// # Critical Implementation Detail: Sample-Level vs Byte-Level Accumulation
+///
+/// For predictor 2 with multi-byte samples (16-bit, 32-bit, 64-bit), the differencing
+/// operates on **whole samples as integers**, not on individual bytes. This is a subtle
+/// but critical distinction:
+///
+/// ## The Problem (Incorrect Byte-Level Approach)
+///
+/// A naive implementation might accumulate bytes independently:
+/// ```text
+/// // WRONG: Byte-level accumulation for 16-bit data
+/// for i in 1..data.len() {
+///     data[i] = data[i].wrapping_add(data[i - 1]);  // Treats each byte separately
+/// }
+/// ```
+///
+/// This produces incorrect results because carries between the low and high bytes
+/// of a sample are not propagated correctly. The visual symptom is **horizontal
+/// stripe artifacts** in rendered images, where every other row appears corrupted.
+///
+/// ## The Solution (Correct Sample-Level Approach)
+///
+/// The correct approach interprets bytes as complete samples, performs integer
+/// addition with proper carry propagation, then writes back:
+/// ```text
+/// // CORRECT: Sample-level accumulation for 16-bit data
+/// for i in 1..num_samples {
+///     let prev = u16::from_le_bytes([data[prev_offset], data[prev_offset + 1]]);
+///     let curr = u16::from_le_bytes([data[curr_offset], data[curr_offset + 1]]);
+///     let sum = curr.wrapping_add(prev);  // Proper 16-bit addition with carry
+///     data[curr_offset..].copy_from_slice(&sum.to_le_bytes());
+/// }
+/// ```
+///
+/// # Row Independence
+///
+/// Each row is processed independently—the first sample of a new row does NOT
+/// accumulate from the last sample of the previous row. This is per the TIFF
+/// specification and prevents error propagation across rows.
+///
+/// # Arguments
+///
+/// * `data` - Decompressed tile data with predictor encoding still applied
+/// * `predictor` - TIFF predictor tag value (1=none, 2=horizontal, 3=floating point)
+/// * `tile_width` - Width of the tile in pixels
+/// * `bands` - Number of bands (samples per pixel)
+/// * `bytes_per_sample` - Size of each sample in bytes (1, 2, 4, or 8)
+///
+/// # Returns
+///
+/// The decoded data with original sample values restored.
+///
+/// # References
+///
+/// - TIFF 6.0 Specification, Section 14: Differencing Predictor
+/// - Adobe TIFF Technote 3: Floating-Point Predictor
 fn apply_predictor(
     data: &[u8],
     predictor: u16,
@@ -1627,24 +1697,30 @@ fn apply_predictor(
     bytes_per_sample: usize,
 ) -> AnyResult<Vec<u8>> {
     match predictor {
-        1 => Ok(data.to_vec()), // No predictor
+        // Predictor 1: No prediction applied, return data unchanged
+        1 => Ok(data.to_vec()),
+
+        // Predictor 2: Horizontal differencing
+        // Samples are stored as: sample[i] = original[i] - original[i-1]
+        // We reverse this by cumulative addition: original[i] = sample[i] + original[i-1]
         2 => {
-            // Horizontal differencing - accumulates at the SAMPLE level, not byte level
-            // For multi-byte samples, we add whole samples (as integers) not individual bytes
             let mut result = data.to_vec();
             let row_bytes = tile_width * bands * bytes_per_sample;
             let samples_per_row = tile_width * bands;
 
+            // Process each row independently (rows don't accumulate across boundaries)
             for row in result.chunks_mut(row_bytes) {
                 match bytes_per_sample {
                     1 => {
-                        // 8-bit: byte-level accumulation
+                        // 8-bit samples: simple byte-level accumulation is correct
+                        // since each sample IS a single byte
                         for i in 1..row.len() {
                             row[i] = row[i].wrapping_add(row[i - 1]);
                         }
                     }
                     2 => {
-                        // 16-bit: accumulate as u16
+                        // 16-bit samples: must accumulate as u16 to handle carries
+                        // between low and high bytes correctly
                         for i in 1..samples_per_row {
                             let prev_offset = (i - 1) * 2;
                             let curr_offset = i * 2;
@@ -1655,7 +1731,9 @@ fn apply_predictor(
                         }
                     }
                     4 => {
-                        // 32-bit: accumulate as u32
+                        // 32-bit samples (includes Float32): accumulate as u32
+                        // The bit pattern is treated as an integer for differencing,
+                        // regardless of whether it represents float or int data
                         for i in 1..samples_per_row {
                             let prev_offset = (i - 1) * 4;
                             let curr_offset = i * 4;
@@ -1672,7 +1750,9 @@ fn apply_predictor(
                         }
                     }
                     8 => {
-                        // 64-bit: accumulate as u64
+                        // 64-bit samples (includes Float64): accumulate as u64
+                        // This case is critical for scientific raster data which often
+                        // uses Float64 for precision (e.g., climate/agricultural models)
                         for i in 1..samples_per_row {
                             let prev_offset = (i - 1) * 8;
                             let curr_offset = i * 8;
@@ -1693,7 +1773,9 @@ fn apply_predictor(
                         }
                     }
                     _ => {
-                        // Fallback for other sample sizes - byte-level accumulation
+                        // Fallback for non-standard sample sizes
+                        // Uses byte-level accumulation with stride, which may not be
+                        // fully correct for all cases but handles uncommon formats
                         for i in bytes_per_sample..row.len() {
                             row[i] = row[i].wrapping_add(row[i - bytes_per_sample]);
                         }
@@ -1703,13 +1785,18 @@ fn apply_predictor(
 
             Ok(result)
         }
+
+        // Predictor 3: Floating-point horizontal differencing
+        // Unlike predictor 2, this operates on bytes at the same position within
+        // each sample (e.g., all high bytes together, all low bytes together).
+        // This exploits the structure of IEEE floating-point representation where
+        // adjacent values often have similar exponent bytes.
         3 => {
-            // Floating point predictor - operates on bytes, not values
-            // Each byte position is differenced independently
             let mut result = data.to_vec();
             let row_bytes = tile_width * bands * bytes_per_sample;
 
             for row in result.chunks_mut(row_bytes) {
+                // Process each byte position independently across all samples
                 for byte_pos in 0..bytes_per_sample {
                     for i in 1..(row.len() / bytes_per_sample) {
                         let idx = i * bytes_per_sample + byte_pos;
@@ -1721,6 +1808,7 @@ fn apply_predictor(
 
             Ok(result)
         }
+
         _ => Err(format!("Unsupported predictor: {predictor}").into()),
     }
 }
@@ -1907,16 +1995,368 @@ mod tests {
         assert!(min >= 0.0, "Min should be >= 0");
         assert!(max <= 255.0, "Max should be <= 255 for 8-bit data");
     }
+
+    // ============================================================
+    // PREDICTOR=2 (HORIZONTAL DIFFERENCING) TESTS
+    //
+    // These tests validate the implementation of TIFF Predictor=2 for multi-byte
+    // data types (16-bit, 32-bit, 64-bit). The correct implementation must perform
+    // sample-level accumulation, NOT byte-level accumulation.
+    //
+    // BACKGROUND:
+    // TIFF Predictor=2 stores the first sample of each row verbatim, then stores
+    // differences between consecutive samples. To reconstruct, we accumulate:
+    //   sample[i] = sample[i] + sample[i-1]  (wrapping on overflow)
+    //
+    // THE BUG:
+    // A naive implementation might iterate over bytes:
+    //   data[i] = data[i] + data[i-1]  // WRONG for multi-byte samples!
+    //
+    // For example, with 16-bit little-endian data [0x00, 0x01] (value 256):
+    // - Byte-level: low byte and high byte accumulate separately, corrupting values
+    // - Sample-level: the u16 value 256 is accumulated correctly
+    //
+    // SYMPTOM:
+    // Incorrect byte-level accumulation causes "horizontal stripe" artifacts in
+    // rendered tiles because carry propagation between bytes is lost.
+    //
+    // REFERENCES:
+    // - TIFF 6.0 Specification, Section 14
+    // - libtiff tif_predict.c: horizontalDifferenceN() functions
+    // ============================================================
+
+    /// Validates 16-bit sample-level accumulation for predictor=2.
+    ///
+    /// This test uses values that would produce incorrect results if bytes were
+    /// accumulated independently. The input [0x0100, 0x0001, 0x0001, 0x0001]
+    /// (256, 1, 1, 1 as u16) should produce [256, 257, 258, 259].
+    ///
+    /// With incorrect byte-level accumulation, the low and high bytes would
+    /// accumulate separately, producing garbage values.
+    #[test]
+    fn test_predictor2_16bit_samples() {
+        // Input: 4 samples of 16-bit data (8 bytes total)
+        // Sample values: [0x0100, 0x0001, 0x0001, 0x0001] (little-endian)
+        // As bytes: [0x00, 0x01, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00]
+        let input: Vec<u8> = vec![0x00, 0x01, 0x01, 0x00, 0x01, 0x00, 0x01, 0x00];
+
+        // Expected after predictor reversal (cumulative sum):
+        // Sample 0: 0x0100 (256)
+        // Sample 1: 0x0100 + 0x0001 = 0x0101 (257)
+        // Sample 2: 0x0101 + 0x0001 = 0x0102 (258)
+        // Sample 3: 0x0102 + 0x0001 = 0x0103 (259)
+        let result = apply_predictor(&input, 2, 4, 1, 2).unwrap();
+
+        // Verify as 16-bit values
+        let s0 = u16::from_le_bytes([result[0], result[1]]);
+        let s1 = u16::from_le_bytes([result[2], result[3]]);
+        let s2 = u16::from_le_bytes([result[4], result[5]]);
+        let s3 = u16::from_le_bytes([result[6], result[7]]);
+
+        assert_eq!(s0, 256, "Sample 0 should be 256");
+        assert_eq!(s1, 257, "Sample 1 should be 256 + 1 = 257");
+        assert_eq!(s2, 258, "Sample 2 should be 257 + 1 = 258");
+        assert_eq!(s3, 259, "Sample 3 should be 258 + 1 = 259");
+    }
+
+    /// Validates 32-bit sample-level accumulation for predictor=2.
+    ///
+    /// This is particularly important for Float32 COG files, where the 4-byte
+    /// IEEE 754 representation must be treated as a single unit during
+    /// accumulation. Byte-level accumulation would corrupt float bit patterns.
+    ///
+    /// The test uses integer values for simplicity, but the same logic applies
+    /// to float bit patterns stored in the TIFF.
+    #[test]
+    fn test_predictor2_32bit_samples() {
+        // 4 samples of 32-bit data
+        // First sample: 0x40000000 (2.0 as f32)
+        // Differences: 0x00000001 each
+        let input: Vec<u8> = vec![
+            0x00, 0x00, 0x00, 0x40,  // 2.0f32 as little-endian
+            0x01, 0x00, 0x00, 0x00,  // +1
+            0x01, 0x00, 0x00, 0x00,  // +1
+            0x01, 0x00, 0x00, 0x00,  // +1
+        ];
+
+        let result = apply_predictor(&input, 2, 4, 1, 4).unwrap();
+
+        let s0 = u32::from_le_bytes([result[0], result[1], result[2], result[3]]);
+        let s1 = u32::from_le_bytes([result[4], result[5], result[6], result[7]]);
+        let s2 = u32::from_le_bytes([result[8], result[9], result[10], result[11]]);
+        let s3 = u32::from_le_bytes([result[12], result[13], result[14], result[15]]);
+
+        assert_eq!(s0, 0x40000000, "Sample 0 should be 0x40000000");
+        assert_eq!(s1, 0x40000001, "Sample 1 should be 0x40000001");
+        assert_eq!(s2, 0x40000002, "Sample 2 should be 0x40000002");
+        assert_eq!(s3, 0x40000003, "Sample 3 should be 0x40000003");
+    }
+
+    /// Validates 64-bit sample-level accumulation for predictor=2.
+    ///
+    /// This is the critical test case - 64-bit Float64 COG files were the original
+    /// source of the "horizontal stripe" rendering bug. The 8-byte IEEE 754 double
+    /// representation requires sample-level accumulation.
+    ///
+    /// When incorrectly implemented with byte-level accumulation, each of the 8 bytes
+    /// accumulates independently, destroying the float bit pattern and causing
+    /// wildly incorrect pixel values that manifest as horizontal stripes across tiles.
+    #[test]
+    fn test_predictor2_64bit_samples() {
+        // 3 samples of 64-bit data, using simple integer values for clarity
+        // Start with 0x0000000000001000, then add 1 each time
+        let input: Vec<u8> = vec![
+            0x00, 0x10, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // 0x1000 (4096)
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // +1
+            0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,  // +1
+        ];
+
+        let result = apply_predictor(&input, 2, 3, 1, 8).unwrap();
+
+        // Convert to u64 and verify sample-level accumulation
+        let s0 = u64::from_le_bytes([
+            result[0], result[1], result[2], result[3],
+            result[4], result[5], result[6], result[7],
+        ]);
+        let s1 = u64::from_le_bytes([
+            result[8], result[9], result[10], result[11],
+            result[12], result[13], result[14], result[15],
+        ]);
+        let s2 = u64::from_le_bytes([
+            result[16], result[17], result[18], result[19],
+            result[20], result[21], result[22], result[23],
+        ]);
+
+        assert_eq!(s0, 0x1000, "Sample 0 should be 0x1000 (4096)");
+        assert_eq!(s1, 0x1001, "Sample 1 should be 0x1000 + 1 = 0x1001 (4097)");
+        assert_eq!(s2, 0x1002, "Sample 2 should be 0x1001 + 1 = 0x1002 (4098)");
+    }
+
+    /// Validates wrapping arithmetic for predictor=2 overflow cases.
+    ///
+    /// TIFF horizontal differencing uses unsigned arithmetic that wraps on overflow.
+    /// This is intentional - the encoder produces differences that may be negative
+    /// when interpreted as signed, but the unsigned representation wraps correctly.
+    ///
+    /// For example, encoding the sequence [65535, 0] produces differences [65535, 1]
+    /// because 0 - 65535 = 1 in u16 wrapping arithmetic. On decode, 65535 + 1 = 0.
+    ///
+    /// This test verifies that our implementation uses wrapping_add() correctly.
+    #[test]
+    fn test_predictor2_wrapping_overflow() {
+        // Test that we use wrapping_add correctly for overflow
+        // Start with max u16, add 1 should wrap to 0
+        let input: Vec<u8> = vec![
+            0xFF, 0xFF,  // 65535
+            0x01, 0x00,  // +1 should wrap to 0
+        ];
+
+        let result = apply_predictor(&input, 2, 2, 1, 2).unwrap();
+
+        let s0 = u16::from_le_bytes([result[0], result[1]]);
+        let s1 = u16::from_le_bytes([result[2], result[3]]);
+
+        assert_eq!(s0, 65535, "Sample 0 should be 65535");
+        assert_eq!(s1, 0, "Sample 1 should wrap to 0 (65535 + 1)");
+    }
+
+    /// Validates row-independent accumulation for predictor=2.
+    ///
+    /// Per TIFF specification, horizontal differencing resets at row boundaries.
+    /// Each row's first sample is stored verbatim, and accumulation starts fresh.
+    /// This is critical because:
+    ///
+    /// 1. Tiles may be decoded in any order (random access)
+    /// 2. Rows within a tile must be independently decodable for parallel processing
+    /// 3. An error in one row should not propagate to subsequent rows
+    ///
+    /// This test verifies that row 2's values are NOT affected by row 1's final
+    /// accumulated value.
+    #[test]
+    fn test_predictor2_multiple_rows() {
+        // 2 rows of 3 samples each (16-bit)
+        let input: Vec<u8> = vec![
+            // Row 1: [100, +1, +1]
+            0x64, 0x00, 0x01, 0x00, 0x01, 0x00,
+            // Row 2: [200, +2, +2] - should NOT continue from row 1
+            0xC8, 0x00, 0x02, 0x00, 0x02, 0x00,
+        ];
+
+        let result = apply_predictor(&input, 2, 3, 1, 2).unwrap();
+
+        // Row 1
+        let r1s0 = u16::from_le_bytes([result[0], result[1]]);
+        let r1s1 = u16::from_le_bytes([result[2], result[3]]);
+        let r1s2 = u16::from_le_bytes([result[4], result[5]]);
+
+        // Row 2
+        let r2s0 = u16::from_le_bytes([result[6], result[7]]);
+        let r2s1 = u16::from_le_bytes([result[8], result[9]]);
+        let r2s2 = u16::from_le_bytes([result[10], result[11]]);
+
+        assert_eq!(r1s0, 100, "Row 1 Sample 0");
+        assert_eq!(r1s1, 101, "Row 1 Sample 1");
+        assert_eq!(r1s2, 102, "Row 1 Sample 2");
+
+        assert_eq!(r2s0, 200, "Row 2 Sample 0 - fresh start");
+        assert_eq!(r2s1, 202, "Row 2 Sample 1");
+        assert_eq!(r2s2, 204, "Row 2 Sample 2");
+    }
+
+    /// Validates 8-bit multiband predictor=2 (byte-level accumulation).
+    ///
+    /// For 8-bit data, sample size equals byte size, so accumulation is naturally
+    /// byte-level. This test ensures that multiband 8-bit images (e.g., RGB) are
+    /// handled correctly - all bands within a row are accumulated sequentially.
+    ///
+    /// Layout for 2-band 8-bit: [pixel0_band0, pixel0_band1, pixel1_band0, pixel1_band1]
+    /// Accumulation proceeds left-to-right across all samples in the row.
+    #[test]
+    fn test_predictor2_multiband_8bit() {
+        // 2 pixels, 2 bands each (8-bit)
+        // Layout: [pixel0_band0, pixel0_band1, pixel1_band0, pixel1_band1]
+        let input: Vec<u8> = vec![10, 20, 1, 2];
+
+        let result = apply_predictor(&input, 2, 2, 2, 1).unwrap();
+
+        // Byte-level accumulation: result[i] = input[i] + result[i-1]
+        // result[0] = 10
+        // result[1] = 20 + 10 = 30
+        // result[2] = 1 + 30 = 31
+        // result[3] = 2 + 31 = 33
+        assert_eq!(result[0], 10, "Byte 0");
+        assert_eq!(result[1], 30, "Byte 1 = 20 + 10");
+        assert_eq!(result[2], 31, "Byte 2 = 1 + 30");
+        assert_eq!(result[3], 33, "Byte 3 = 2 + 31");
+    }
+
+    /// Validates 16-bit multiband predictor=2 (sample-level accumulation).
+    ///
+    /// For 16-bit multiband data, each sample (regardless of which band) must be
+    /// accumulated as a u16, not as individual bytes. This test catches bugs where
+    /// multiband handling might incorrectly interleave byte-level operations.
+    ///
+    /// The key insight: samples_per_row = tile_width * bands, and we accumulate
+    /// across ALL samples in the row, treating each 2-byte pair as a single u16.
+    #[test]
+    fn test_predictor2_multiband_16bit() {
+        // 2 pixels, 2 bands each (16-bit)
+        // Layout: [p0b0_lo, p0b0_hi, p0b1_lo, p0b1_hi, p1b0_lo, p1b0_hi, p1b1_lo, p1b1_hi]
+        // Sample values: [100, 200, 1, 2]
+        let input: Vec<u8> = vec![
+            100, 0,  // pixel 0 band 0 = 100
+            200, 0,  // pixel 0 band 1 = 200
+            1, 0,    // pixel 1 band 0 = +1
+            2, 0,    // pixel 1 band 1 = +2
+        ];
+
+        let result = apply_predictor(&input, 2, 2, 2, 2).unwrap();
+
+        // Sample-level accumulation within row
+        // samples_per_row = tile_width * bands = 2 * 2 = 4
+        // s[0] = 100, s[1] = 200 + 100 = 300, s[2] = 1 + 300 = 301, s[3] = 2 + 301 = 303
+        let s0 = u16::from_le_bytes([result[0], result[1]]);
+        let s1 = u16::from_le_bytes([result[2], result[3]]);
+        let s2 = u16::from_le_bytes([result[4], result[5]]);
+        let s3 = u16::from_le_bytes([result[6], result[7]]);
+
+        assert_eq!(s0, 100, "Sample 0");
+        assert_eq!(s1, 300, "Sample 1 = 200 + 100");
+        assert_eq!(s2, 301, "Sample 2 = 1 + 300");
+        assert_eq!(s3, 303, "Sample 3 = 2 + 301");
+    }
+
+    // ============================================================
+    // OVERVIEW QUALITY HINT TESTS
+    //
+    // OverviewQualityHint controls which COG overview levels are considered
+    // acceptable quality for tile serving. This is important because:
+    //
+    // 1. Some COG files have blurry or poorly-resampled overviews
+    // 2. Performance vs. quality tradeoffs vary by use case
+    // 3. Layer administrators may want to force full-resolution serving
+    //
+    // The hint is stored in the database as an i32:
+    //   - NULL  -> ComputeAtRuntime (analyze at load time)
+    //   - -1    -> NoneUsable (always use full resolution)
+    //   - -2    -> AllUsable (all overviews are acceptable)
+    //   - n>=0  -> MinUsable(n) (overview index n and higher are acceptable)
+    // ============================================================
+
+    /// Validates database value to OverviewQualityHint conversion.
+    ///
+    /// Tests the from_db_value() function which converts nullable i32 database
+    /// values to the enum representation used in application code.
+    #[test]
+    fn test_overview_hint_from_db_value() {
+        // None -> ComputeAtRuntime
+        assert!(matches!(
+            OverviewQualityHint::from_db_value(None),
+            OverviewQualityHint::ComputeAtRuntime
+        ));
+
+        // -1 -> NoneUsable (force full resolution)
+        assert!(matches!(
+            OverviewQualityHint::from_db_value(Some(-1)),
+            OverviewQualityHint::NoneUsable
+        ));
+
+        // -2 -> AllUsable (all overviews are good quality)
+        assert!(matches!(
+            OverviewQualityHint::from_db_value(Some(-2)),
+            OverviewQualityHint::AllUsable
+        ));
+
+        // Positive values -> MinUsable(n)
+        assert!(matches!(
+            OverviewQualityHint::from_db_value(Some(0)),
+            OverviewQualityHint::MinUsable(0)
+        ));
+        assert!(matches!(
+            OverviewQualityHint::from_db_value(Some(3)),
+            OverviewQualityHint::MinUsable(3)
+        ));
+    }
+
+    /// Validates OverviewQualityHint to database value conversion.
+    ///
+    /// Tests the to_db_value() function which converts the enum back to the
+    /// nullable i32 representation for database storage. This is the inverse
+    /// of from_db_value() and ensures round-trip consistency.
+    #[test]
+    fn test_overview_hint_to_db_value() {
+        // NoneUsable = -1 (force full resolution)
+        assert_eq!(OverviewQualityHint::NoneUsable.to_db_value(), Some(-1));
+        // AllUsable = -2 (all overviews are good)
+        assert_eq!(OverviewQualityHint::AllUsable.to_db_value(), Some(-2));
+        assert_eq!(OverviewQualityHint::MinUsable(0).to_db_value(), Some(0));
+        assert_eq!(OverviewQualityHint::MinUsable(5).to_db_value(), Some(5));
+        // ComputeAtRuntime returns None (no db value)
+        assert_eq!(OverviewQualityHint::ComputeAtRuntime.to_db_value(), None);
+    }
 }
 
 // ============================================================
-// COMPREHENSIVE TESTS FOR COG READER
-// These tests verify:
-// 1. Scale calculation uses FLOOR division (matching GDAL)
-// 2. CRS detection works correctly
-// 3. Pixel values match GDAL output
+// COMPREHENSIVE INTEGRATION TESTS FOR COG READER
+//
+// These tests verify correct behavior against real COG files and GDAL output.
+// They require test data files in data/grayscale/ to run (skipped if missing).
+//
+// Key behaviors tested:
+// 1. CRS detection from GeoKey tags
+// 2. Overview scale calculation (MUST use floor division to match GDAL)
+// 3. Coordinate transformation accuracy
+// 4. Overview selection algorithm
+// 5. Predictor=2 implementation (covered in detail above)
+//
+// IMPORTANT: These tests catch real-world bugs that unit tests may miss,
+// such as the ceiling vs. floor division bug that caused ~6% coordinate errors.
 // ============================================================
 
+/// Verifies CRS detection for Web Mercator (EPSG:3857) projection.
+///
+/// The test file uses EPSG:3857 (Web Mercator), commonly used for web mapping.
+/// Correct CRS detection is essential for proper coordinate transformation.
 #[test]
 fn test_gray_3857_crs_detection() {
     let path = "data/grayscale/gray_3857-cog.tif";
@@ -2082,7 +2522,14 @@ fn test_scale_factor_coordinate_mapping() {
     }
 }
 
-/// TEST: Best overview selection returns appropriate level
+/// Validates the overview selection algorithm.
+///
+/// The best_overview_for_resolution() method should select the smallest overview
+/// that can provide sufficient detail for the requested extent. This test
+/// verifies that:
+/// - Small extents prefer full resolution (or low-index overviews)
+/// - Large extents use higher-index overviews for performance
+/// - The returned index is always valid
 #[test]
 fn test_best_overview_selection() {
     let path = "data/grayscale/gray_3857-cog.tif";
