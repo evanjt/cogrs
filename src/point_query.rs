@@ -370,3 +370,139 @@ mod tests {
         assert_eq!(result.valid_band_count(), 0);
     }
 }
+
+#[cfg(test)]
+mod integration_tests {
+    use super::*;
+    use std::sync::Arc;
+    use crate::range_reader::LocalRangeReader;
+
+    /// Test PointQuery with a real COG file (EPSG:4326 global dataset)
+    #[test]
+    fn test_point_query_real_cog_4326() {
+        // Path to test COG (global EPSG:4326)
+        let path = "/home/evan/projects/personal/geo/tileyolo/data/viridis/output_cog.tif";
+        if !std::path::Path::new(path).exists() {
+            println!("Skipping: test file not found at {}", path);
+            return;
+        }
+
+        let reader = LocalRangeReader::new(path).unwrap();
+        let cog = CogReader::from_reader(Arc::new(reader)).unwrap();
+
+        println!("COG metadata:");
+        println!("  Size: {}x{}", cog.metadata.width, cog.metadata.height);
+        println!("  Bands: {}", cog.metadata.bands);
+        println!("  CRS: {:?}", cog.metadata.crs_code);
+
+        // Sample at center of the world (should be valid for global dataset)
+        let result = cog.sample_lonlat(0.0, 0.0).unwrap();
+        println!("Sample at (0, 0): {:?}", result);
+
+        assert!(result.is_valid, "Center of world should be valid");
+        assert_eq!(result.bands, cog.metadata.bands);
+        assert_eq!(result.input_crs, 4326);
+
+        // Sample at San Francisco
+        let sf_result = cog.sample_lonlat(-122.4, 37.8).unwrap();
+        println!("Sample at SF (-122.4, 37.8): {:?}", sf_result);
+
+        if sf_result.is_valid {
+            assert!(!sf_result.values.is_empty());
+            // Check we got a value for band 0
+            let band0 = sf_result.get(0);
+            println!("  Band 0 value: {:?}", band0);
+        }
+
+        // Sample at Tokyo
+        let tokyo_result = cog.sample_lonlat(139.7, 35.7).unwrap();
+        println!("Sample at Tokyo (139.7, 35.7): {:?}", tokyo_result);
+
+        // Test out-of-bounds coordinates
+        let oob_result = cog.sample_lonlat(0.0, 100.0).unwrap(); // lat > 90 is invalid
+        println!("Sample at invalid (0, 100): is_valid={}", oob_result.is_valid);
+    }
+
+    /// Test PointQuery with EPSG:3857 COG file
+    #[test]
+    fn test_point_query_real_cog_3857() {
+        let path = "/home/evan/projects/personal/geo/tileyolo/data/grayscale/gray_3857-cog.tif";
+        if !std::path::Path::new(path).exists() {
+            println!("Skipping: test file not found at {}", path);
+            return;
+        }
+
+        let reader = LocalRangeReader::new(path).unwrap();
+        let cog = CogReader::from_reader(Arc::new(reader)).unwrap();
+
+        println!("COG metadata (3857):");
+        println!("  Size: {}x{}", cog.metadata.width, cog.metadata.height);
+        println!("  Bands: {}", cog.metadata.bands);
+        println!("  CRS: {:?}", cog.metadata.crs_code);
+
+        // For a 3857 COG, we can query with lon/lat - it should auto-reproject
+        let result = cog.sample_lonlat(0.0, 0.0).unwrap();
+        println!("Sample at (0, 0) via lonlat: {:?}", result);
+
+        // Also test querying in native CRS (3857)
+        // Origin in 3857 is (0, 0) which maps to (0, 0) in 4326
+        let result_3857 = cog.sample_crs(3857, 0.0, 0.0).unwrap();
+        println!("Sample at (0, 0) in EPSG:3857: {:?}", result_3857);
+
+        // Query at a point in Web Mercator coordinates
+        // ~London: lon=-0.1, lat=51.5 -> approx (-11131, 6711000) in 3857
+        let london_merc = cog.sample_crs(3857, -11131.0, 6711000.0).unwrap();
+        println!("Sample near London in 3857: {:?}", london_merc);
+    }
+
+    /// Test batch point queries
+    #[test]
+    fn test_point_query_batch() {
+        let path = "/home/evan/projects/personal/geo/tileyolo/data/viridis/output_cog.tif";
+        if !std::path::Path::new(path).exists() {
+            println!("Skipping: test file not found");
+            return;
+        }
+
+        let reader = LocalRangeReader::new(path).unwrap();
+        let cog = CogReader::from_reader(Arc::new(reader)).unwrap();
+
+        let points = vec![
+            (0.0, 0.0),       // Equator/Prime meridian
+            (-122.4, 37.8),   // San Francisco
+            (139.7, 35.7),    // Tokyo
+            (2.3, 48.9),      // Paris
+            (-43.2, -22.9),   // Rio
+        ];
+
+        let results = cog.sample_points_lonlat(&points).unwrap();
+
+        assert_eq!(results.len(), 5);
+
+        for (i, (point, result)) in points.iter().zip(results.iter()).enumerate() {
+            println!("Point {}: ({:.1}, {:.1}) -> valid={}, bands={}",
+                     i, point.0, point.1, result.is_valid, result.values.len());
+        }
+    }
+
+    /// Test sample_point convenience function
+    #[test]
+    fn test_sample_point_convenience() {
+        let path = "/home/evan/projects/personal/geo/tileyolo/data/viridis/output_cog.tif";
+        if !std::path::Path::new(path).exists() {
+            println!("Skipping: test file not found");
+            return;
+        }
+
+        let reader = LocalRangeReader::new(path).unwrap();
+        let cog = CogReader::from_reader(Arc::new(reader)).unwrap();
+
+        // Use the convenience function
+        let values = sample_point(&cog, 0.0, 0.0).unwrap();
+
+        println!("sample_point result: {:?}", values);
+
+        // Should return a HashMap with band indices as keys
+        assert!(values.contains_key(&0), "Should have band 0");
+    }
+}
