@@ -97,8 +97,10 @@ pub use xyz_tile::{
     TileExtractor,
     BoundingBox,
     CoordTransformer,
+    ResamplingMethod,
     extract_xyz_tile,
     extract_tile_with_extent,
+    extract_tile_with_extent_resampled,
 };
 
 // ============================================================================

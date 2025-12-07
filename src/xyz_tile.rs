@@ -23,6 +23,24 @@ use proj4rs::transform::transform;
 use crate::cog_reader::CogReader;
 use crate::geometry::projection::{get_proj_string, is_geographic_crs};
 
+/// Resampling method for tile extraction.
+///
+/// Controls how pixel values are interpolated when the output resolution
+/// doesn't match the source resolution exactly.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ResamplingMethod {
+    /// Nearest neighbor - fastest, but can produce blocky results when upsampling.
+    /// Uses the value of the closest source pixel.
+    #[default]
+    Nearest,
+    /// Bilinear interpolation - smoother results, good balance of quality and speed.
+    /// Linearly interpolates between the 4 nearest source pixels.
+    Bilinear,
+    /// Bicubic interpolation - highest quality, but slower.
+    /// Uses a 4x4 grid of source pixels with cubic weighting.
+    Bicubic,
+}
+
 /// Extracted tile data with band information
 #[derive(Debug, Clone)]
 pub struct TileData {
@@ -75,6 +93,26 @@ impl BoundingBox {
 
 /// Half the earth's circumference in Web Mercator meters
 const HALF_EARTH: f64 = 20037508.342789244;
+
+/// Bicubic weight function (Mitchell-Netravali with B=C=1/3)
+///
+/// This provides a good balance between sharpness and ringing artifacts.
+#[inline]
+fn bicubic_weight(x: f64) -> f64 {
+    let x = x.abs();
+    if x < 1.0 {
+        (1.0 / 6.0) * ((12.0 - 9.0 * 0.333 - 6.0 * 0.333) * x * x * x
+                     + (-18.0 + 12.0 * 0.333 + 6.0 * 0.333) * x * x
+                     + (6.0 - 2.0 * 0.333))
+    } else if x < 2.0 {
+        (1.0 / 6.0) * ((-0.333 - 6.0 * 0.333) * x * x * x
+                     + (6.0 * 0.333 + 30.0 * 0.333) * x * x
+                     + (-12.0 * 0.333 - 48.0 * 0.333) * x
+                     + (8.0 * 0.333 + 24.0 * 0.333))
+    } else {
+        0.0
+    }
+}
 
 /// Fast inline conversion from Web Mercator X to longitude (degrees)
 #[inline(always)]
@@ -316,6 +354,7 @@ pub struct TileExtractor<'a> {
     reader: &'a CogReader,
     bounds: Option<BoundingBox>,
     output_size: (usize, usize),
+    resampling: ResamplingMethod,
 }
 
 impl std::fmt::Debug for TileExtractor<'_> {
@@ -323,6 +362,7 @@ impl std::fmt::Debug for TileExtractor<'_> {
         f.debug_struct("TileExtractor")
             .field("bounds", &self.bounds)
             .field("output_size", &self.output_size)
+            .field("resampling", &self.resampling)
             .finish_non_exhaustive()
     }
 }
@@ -335,6 +375,7 @@ impl<'a> TileExtractor<'a> {
             reader,
             bounds: None,
             output_size: (256, 256),
+            resampling: ResamplingMethod::default(),
         }
     }
 
@@ -372,12 +413,31 @@ impl<'a> TileExtractor<'a> {
         self
     }
 
+    /// Set the resampling method.
+    ///
+    /// Default is `ResamplingMethod::Nearest` (fastest).
+    /// Use `Bilinear` for smoother results or `Bicubic` for highest quality.
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let tile = TileExtractor::new(&reader)
+    ///     .xyz(10, 512, 512)
+    ///     .resampling(ResamplingMethod::Bilinear)
+    ///     .extract()?;
+    /// ```
+    #[must_use]
+    pub fn resampling(mut self, method: ResamplingMethod) -> Self {
+        self.resampling = method;
+        self
+    }
+
     /// Extract the tile with the configured parameters.
     ///
     /// Returns an error if bounds were not set.
     pub fn extract(self) -> Result<TileData, Box<dyn std::error::Error + Send + Sync>> {
         let bounds = self.bounds.ok_or("Bounds not set: use .xyz() or .bounds()")?;
-        extract_tile_with_extent(self.reader, &bounds, self.output_size)
+        extract_tile_with_extent_resampled(self.reader, &bounds, self.output_size, self.resampling)
     }
 
     /// Get the configured output size.
@@ -420,11 +480,27 @@ pub fn extract_xyz_tile(
 /// Extract a tile from a COG reader using a Web Mercator bounding box
 ///
 /// This is the main extraction function that handles overview selection,
-/// coordinate transformation, and pixel sampling.
+/// coordinate transformation, and pixel sampling. Uses nearest neighbor resampling.
 pub fn extract_tile_with_extent(
     reader: &CogReader,
     extent_3857: &BoundingBox,
     tile_size: (usize, usize),
+) -> Result<TileData, Box<dyn std::error::Error + Send + Sync>> {
+    extract_tile_with_extent_resampled(reader, extent_3857, tile_size, ResamplingMethod::Nearest)
+}
+
+/// Extract a tile from a COG reader with configurable resampling method
+///
+/// # Arguments
+/// * `reader` - The COG reader with loaded metadata
+/// * `extent_3857` - Bounding box in Web Mercator (EPSG:3857)
+/// * `tile_size` - Output tile dimensions (width, height)
+/// * `resampling` - Resampling method to use
+pub fn extract_tile_with_extent_resampled(
+    reader: &CogReader,
+    extent_3857: &BoundingBox,
+    tile_size: (usize, usize),
+    resampling: ResamplingMethod,
 ) -> Result<TileData, Box<dyn std::error::Error + Send + Sync>> {
     let metadata = &reader.metadata;
     let geo_transform = &metadata.geo_transform;
@@ -456,7 +532,7 @@ pub fn extract_tile_with_extent(
     let overview_idx = reader.best_overview_for_resolution(extent_src_width, extent_src_height);
 
     // Call the internal function with automatic fallback for empty overviews
-    extract_tile_with_overview(reader, extent_3857, tile_size, overview_idx, strategy)
+    extract_tile_with_overview(reader, extent_3857, tile_size, overview_idx, strategy, resampling)
 }
 
 /// Internal function that extracts a tile using a specific overview level (or full resolution if None)
@@ -466,6 +542,7 @@ fn extract_tile_with_overview(
     tile_size: (usize, usize),
     overview_idx: Option<usize>,
     strategy: TransformStrategy,
+    resampling: ResamplingMethod,
 ) -> Result<TileData, Box<dyn std::error::Error + Send + Sync>> {
     let (tile_size_x, tile_size_y) = tile_size;
     let metadata = &reader.metadata;
@@ -609,7 +686,7 @@ fn extract_tile_with_overview(
 
     // If all tile reads failed, try falling back to full resolution
     if tile_data_cache.is_empty() && overview_idx.is_some() {
-        return extract_tile_with_overview(reader, extent_3857, tile_size, None, strategy);
+        return extract_tile_with_overview(reader, extent_3857, tile_size, None, strategy, resampling);
     }
 
     let num_bands = metadata.bands;
@@ -677,9 +754,6 @@ fn extract_tile_with_overview(
             continue;
         }
 
-        let src_py_int = src_py.round() as isize;
-        let src_py_clamped = src_py_int.max(0).min(eff_height as isize - 1) as usize;
-
         for out_x in 0..tile_size_x {
             // Use pre-computed X for FastMerc2Geo and Identity
             let src_px = if use_precomputed_x {
@@ -699,19 +773,88 @@ fn extract_tile_with_overview(
                 continue;
             }
 
-            let src_px_int = src_px.round() as isize;
-            let src_px_clamped = src_px_int.max(0).min(eff_width as isize - 1) as usize;
-
             let out_idx = (out_y * tile_size_x + out_x) * num_bands;
 
-            // Sample each band with nearest neighbor
-            for band in 0..num_bands {
-                if let Some(value) = sample_pixel(src_px_clamped, src_py_clamped, band) {
-                    pixel_data[out_idx + band] = value;
+            // Sample each band using the configured resampling method
+            match resampling {
+                ResamplingMethod::Nearest => {
+                    let src_px_int = src_px.round() as isize;
+                    let src_px_clamped = src_px_int.max(0).min(eff_width as isize - 1) as usize;
+                    let src_py_clamped = src_py.round().max(0.0).min(eff_height as f64 - 1.0) as usize;
+
+                    for band in 0..num_bands {
+                        if let Some(value) = sample_pixel(src_px_clamped, src_py_clamped, band) {
+                            pixel_data[out_idx + band] = value;
+                        }
+                    }
+                }
+                ResamplingMethod::Bilinear => {
+                    // Bilinear interpolation using 4 nearest pixels
+                    let x0 = src_px.floor() as isize;
+                    let y0 = src_py.floor() as isize;
+                    let x1 = x0 + 1;
+                    let y1 = y0 + 1;
+
+                    // Fractional parts for interpolation weights
+                    let fx = src_px - x0 as f64;
+                    let fy = src_py - y0 as f64;
+
+                    // Clamp to valid range
+                    let x0c = x0.max(0).min(eff_width as isize - 1) as usize;
+                    let x1c = x1.max(0).min(eff_width as isize - 1) as usize;
+                    let y0c = y0.max(0).min(eff_height as isize - 1) as usize;
+                    let y1c = y1.max(0).min(eff_height as isize - 1) as usize;
+
+                    for band in 0..num_bands {
+                        let v00 = sample_pixel(x0c, y0c, band).unwrap_or(0.0);
+                        let v10 = sample_pixel(x1c, y0c, band).unwrap_or(0.0);
+                        let v01 = sample_pixel(x0c, y1c, band).unwrap_or(0.0);
+                        let v11 = sample_pixel(x1c, y1c, band).unwrap_or(0.0);
+
+                        // Bilinear interpolation formula
+                        let value = v00 * (1.0 - fx as f32) * (1.0 - fy as f32)
+                                  + v10 * (fx as f32) * (1.0 - fy as f32)
+                                  + v01 * (1.0 - fx as f32) * (fy as f32)
+                                  + v11 * (fx as f32) * (fy as f32);
+
+                        pixel_data[out_idx + band] = value;
+                    }
+                }
+                ResamplingMethod::Bicubic => {
+                    // Bicubic interpolation using 4x4 grid of pixels
+                    let x0 = src_px.floor() as isize;
+                    let y0 = src_py.floor() as isize;
+
+                    // Fractional parts
+                    let fx = src_px - x0 as f64;
+                    let fy = src_py - y0 as f64;
+
+                    for band in 0..num_bands {
+                        let mut sum = 0.0f32;
+                        let mut weight_sum = 0.0f32;
+
+                        // Sample 4x4 grid centered around (x0, y0)
+                        for j in -1..=2isize {
+                            for i in -1..=2isize {
+                                let px = (x0 + i).max(0).min(eff_width as isize - 1) as usize;
+                                let py = (y0 + j).max(0).min(eff_height as isize - 1) as usize;
+
+                                if let Some(v) = sample_pixel(px, py, band) {
+                                    // Bicubic weight (Mitchell-Netravali with B=C=1/3)
+                                    let wx = bicubic_weight(i as f64 - fx);
+                                    let wy = bicubic_weight(j as f64 - fy);
+                                    let w = (wx * wy) as f32;
+                                    sum += v * w;
+                                    weight_sum += w;
+                                }
+                            }
+                        }
+
+                        pixel_data[out_idx + band] = if weight_sum > 0.0 { sum / weight_sum } else { 0.0 };
+                    }
                 }
             }
         }
-
     }
 
     // Drop sample_pixel closure
@@ -865,6 +1008,32 @@ mod tests {
         assert_eq!(bbox.miny, -20.0);
         assert_eq!(bbox.maxx, 30.0);
         assert_eq!(bbox.maxy, 40.0);
+    }
+
+    #[test]
+    fn test_resampling_method_default() {
+        assert_eq!(ResamplingMethod::default(), ResamplingMethod::Nearest);
+    }
+
+    #[test]
+    fn test_bicubic_weight() {
+        // At x=0, weight should be maximum (~0.889 for Mitchell-Netravali B=C=1/3)
+        let w0 = bicubic_weight(0.0);
+        assert!(w0 > 0.8, "Weight at 0 should be near 0.889: {}", w0);
+
+        // At x=1, weight should be smaller but can be negative for Mitchell filter
+        let w1 = bicubic_weight(1.0);
+        assert!(w1.abs() < w0, "Weight at 1 should be smaller than at 0: {}", w1);
+
+        // At x=2 and beyond, weight should be 0
+        let w2 = bicubic_weight(2.0);
+        assert!(w2.abs() < 0.001, "Weight at 2 should be ~0: {}", w2);
+
+        let w3 = bicubic_weight(3.0);
+        assert_eq!(w3, 0.0, "Weight at 3 should be 0");
+
+        // Weights should be symmetric
+        assert!((bicubic_weight(0.5) - bicubic_weight(-0.5)).abs() < 0.0001);
     }
 }
 
