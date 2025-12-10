@@ -5,12 +5,6 @@ use std::sync::{Arc, Mutex};
 
 const CACHE_CAPACITY_BYTES: usize = 512 * 1024 * 1024; // 512 MB upper bound
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
-pub enum TileKind {
-    Chunked,
-    Lzw,
-}
-
 /// Key for cached decompressed tiles
 /// Includes source identifier, tile index, and optional overview index
 #[derive(Clone, Eq, PartialEq)]
@@ -33,10 +27,15 @@ impl Hash for TileKey {
 
 impl TileKey {
     fn new(source: &str, tile_index: usize, overview_idx: Option<usize>) -> Self {
+        // Casts are safe: tile counts and overview counts are typically small
+        #[allow(clippy::cast_possible_truncation)]
         TileKey {
             source: Arc::from(source),
             tile_index: tile_index as u32,
-            overview_idx: overview_idx.map(|i| i as u16),
+            overview_idx: overview_idx.map(|i| {
+                #[allow(clippy::cast_possible_truncation)]
+                { i as u16 }
+            }),
         }
     }
 }
@@ -66,15 +65,12 @@ impl TileCache {
     }
 
     fn get(&mut self, key: &TileKey) -> Option<Arc<Vec<f32>>> {
-        match self.entries.get(key) {
-            Some(entry) => {
-                self.hits += 1;
-                Some(Arc::clone(&entry.data))
-            }
-            None => {
-                self.misses += 1;
-                None
-            }
+        if let Some(entry) = self.entries.get(key) {
+            self.hits += 1;
+            Some(Arc::clone(&entry.data))
+        } else {
+            self.misses += 1;
+            None
         }
     }
 
@@ -117,18 +113,27 @@ fn make_key(source: &str, tile_index: usize, overview_idx: Option<usize>) -> Til
 /// - `source`: File path or URL identifying the COG
 /// - `tile_index`: Tile index within the IFD
 /// - `overview_idx`: None for full resolution, Some(n) for overview n
+///
+/// # Panics
+/// Panics if the cache mutex lock is poisoned.
 pub fn get(source: &str, tile_index: usize, overview_idx: Option<usize>) -> Option<Arc<Vec<f32>>> {
     let key = make_key(source, tile_index, overview_idx);
     TILE_CACHE.lock().unwrap().get(&key)
 }
 
 /// Check if a tile is cached
+///
+/// # Panics
+/// Panics if the cache mutex lock is poisoned.
 pub fn contains(source: &str, tile_index: usize, overview_idx: Option<usize>) -> bool {
     let key = make_key(source, tile_index, overview_idx);
     TILE_CACHE.lock().unwrap().contains(&key)
 }
 
 /// Insert a decompressed tile into the cache
+///
+/// # Panics
+/// Panics if the cache mutex lock is poisoned.
 pub fn insert(source: &str, tile_index: usize, overview_idx: Option<usize>, data: Arc<Vec<f32>>) {
     let size_bytes = data.len() * std::mem::size_of::<f32>();
     let key = make_key(source, tile_index, overview_idx);
@@ -136,31 +141,44 @@ pub fn insert(source: &str, tile_index: usize, overview_idx: Option<usize>, data
 }
 
 // ============================================================================
-// Legacy API for backward compatibility with tiff_chunked.rs and lzw_fallback.rs
-// These will be phased out once those modules are updated
+// Path-based API for tiff_chunked.rs and lzw_fallback.rs
 // ============================================================================
 
 use std::path::Path;
 
-/// Legacy get function for backward compatibility
-pub fn get_legacy(path: &Path, _kind: TileKind, index: usize) -> Option<Arc<Vec<f32>>> {
+/// Get cached tile by file path (used by tiff_chunked and lzw_fallback modules)
+///
+/// # Panics
+/// Panics if the cache mutex lock is poisoned.
+#[must_use]
+pub fn get_by_path(path: &Path, index: usize) -> Option<Arc<Vec<f32>>> {
     let source = path.to_string_lossy();
     get(&source, index, None)
 }
 
-/// Legacy contains function for backward compatibility
-pub fn contains_legacy(path: &Path, _kind: TileKind, index: usize) -> bool {
+/// Check if tile is cached by file path
+///
+/// # Panics
+/// Panics if the cache mutex lock is poisoned.
+#[must_use]
+pub fn contains_by_path(path: &Path, index: usize) -> bool {
     let source = path.to_string_lossy();
     contains(&source, index, None)
 }
 
-/// Legacy insert function for backward compatibility
-pub fn insert_legacy(path: &Path, _kind: TileKind, index: usize, data: Arc<Vec<f32>>) {
+/// Insert tile into cache by file path
+///
+/// # Panics
+/// Panics if the cache mutex lock is poisoned.
+pub fn insert_by_path(path: &Path, index: usize, data: Arc<Vec<f32>>) {
     let source = path.to_string_lossy();
     insert(&source, index, None, data);
 }
 
-/// Cache statistics: (entry_count, current_bytes, capacity_bytes, hits, misses)
+/// Cache statistics: (`entry_count`, `current_bytes`, `capacity_bytes`, hits, misses)
+///
+/// # Panics
+/// Panics if the cache mutex lock is poisoned.
 pub fn stats() -> (usize, usize, usize, u64, u64) {
     let cache = TILE_CACHE.lock().unwrap();
     (cache.entries.len(), cache.current_bytes, cache.capacity_bytes, cache.hits, cache.misses)

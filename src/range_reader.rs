@@ -19,6 +19,9 @@ use crate::tiff_utils::AnyResult;
 /// - HTTP URLs (using Range header)
 pub trait RangeReader: Send + Sync {
     /// Read a range of bytes from the source
+    ///
+    /// # Errors
+    /// Returns an error if the read operation fails due to I/O errors, network issues, or invalid ranges.
     fn read_range(&self, offset: u64, length: usize) -> AnyResult<Vec<u8>>;
 
     /// Get the total size of the source in bytes
@@ -41,6 +44,8 @@ pub struct LocalRangeReader {
 }
 
 impl LocalRangeReader {
+    /// # Errors
+    /// Returns an error if the file does not exist or metadata cannot be read.
     pub fn new(path: impl AsRef<Path>) -> AnyResult<Self> {
         let path = path.as_ref().to_path_buf();
         let metadata = std::fs::metadata(&path)?;
@@ -58,13 +63,16 @@ impl LocalRangeReader {
 ///
 /// # Example
 ///
-/// ```rust,ignore
+/// ```rust,no_run
 /// use cogrs::{CogReader, MemoryRangeReader};
 /// use std::sync::Arc;
 ///
-/// let bytes = std::fs::read("path/to/file.tif")?;
-/// let reader = MemoryRangeReader::new(bytes, "cached://my-layer.tif".to_string());
-/// let cog = CogReader::from_reader(Arc::new(reader))?;
+/// fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+///     let bytes = std::fs::read("path/to/file.tif")?;
+///     let reader = MemoryRangeReader::new(bytes, "cached://my-layer.tif".to_string());
+///     let cog = CogReader::from_reader(Arc::new(reader))?;
+///     Ok(())
+/// }
 /// ```
 pub struct MemoryRangeReader {
     data: Arc<Vec<u8>>,
@@ -72,11 +80,12 @@ pub struct MemoryRangeReader {
 }
 
 impl MemoryRangeReader {
-    /// Create a new MemoryRangeReader from a byte vector
+    /// Create a new `MemoryRangeReader` from a byte vector
     ///
     /// # Arguments
     /// * `data` - The COG file bytes
-    /// * `identifier` - A human-readable identifier for logging (e.g., "memory://layer.tif")
+    /// * `identifier` - A human-readable identifier for logging (e.g., "<memory://layer.tif>")
+    #[must_use] 
     pub fn new(data: Vec<u8>, identifier: String) -> Self {
         Self {
             data: Arc::new(data),
@@ -85,6 +94,7 @@ impl MemoryRangeReader {
     }
 
     /// Create from an `Arc<Vec<u8>>` to avoid cloning large buffers
+    #[must_use] 
     pub fn from_arc(data: Arc<Vec<u8>>, identifier: String) -> Self {
         Self { data, identifier }
     }
@@ -92,6 +102,8 @@ impl MemoryRangeReader {
 
 impl RangeReader for MemoryRangeReader {
     fn read_range(&self, offset: u64, length: usize) -> AnyResult<Vec<u8>> {
+        // Cast is safe for in-memory data: usize is always sufficient for memory addresses
+        #[allow(clippy::cast_possible_truncation)]
         let start = offset as usize;
         let end = (start + length).min(self.data.len());
         if start >= self.data.len() {
@@ -140,6 +152,9 @@ pub struct HttpRangeReader {
 }
 
 impl HttpRangeReader {
+    /// # Errors
+    /// Returns an error if the HTTP HEAD request fails, the URL is invalid,
+    /// or the server does not return a valid Content-Length header.
     pub fn new(url: &str) -> AnyResult<Self> {
         let client = reqwest::blocking::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
@@ -152,7 +167,7 @@ impl HttpRangeReader {
             .get("content-length")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse().ok())
-            .unwrap_or(0);
+            .ok_or_else(|| format!("HTTP server did not return Content-Length header for {url}"))?;
 
         Ok(Self {
             url: url.to_string(),
@@ -186,55 +201,51 @@ impl RangeReader for HttpRangeReader {
     }
 }
 
-/// S3 range reader using `object_store`
+/// S3 range reader for public buckets via HTTPS
+///
+/// Note: For full S3 support with credentials, use `S3RangeReaderSync` from the `s3` module.
 pub struct S3RangeReader {
-    #[allow(dead_code)]
-    bucket: String,
-    #[allow(dead_code)]
-    key: String,
     size: u64,
-    // We store the URL for identification
     url: String,
 }
 
 impl S3RangeReader {
-    /// Create from an S3 URL like <s3://bucket/key>
+    /// Create from an S3 URL like `s3://bucket/key`
+    ///
+    /// Validates the URL format but does not fetch size (use `from_https` for that).
+    ///
+    /// # Errors
+    /// Returns an error if the URL is invalid, missing bucket/key, or not using the s3:// scheme.
     pub fn new(url: &str) -> AnyResult<Self> {
-        // Parse s3://bucket/key format
         let url_parsed = url::Url::parse(url)?;
 
         if url_parsed.scheme() != "s3" {
             return Err("URL must use s3:// scheme".into());
         }
 
-        let bucket = url_parsed.host_str()
-            .ok_or("Missing bucket in S3 URL")?
-            .to_string();
+        if url_parsed.host_str().is_none() {
+            return Err("Missing bucket in S3 URL".into());
+        }
 
-        let key = url_parsed.path().trim_start_matches('/').to_string();
-
+        let key = url_parsed.path().trim_start_matches('/');
         if key.is_empty() {
             return Err("Missing key in S3 URL".into());
         }
 
-        // For now, return a placeholder - actual S3 implementation would use aws-sdk-s3
-        // This is a simplified version that converts to HTTPS for public buckets
         Ok(Self {
-            bucket,
-            key,
-            size: 0, // Would be fetched via HEAD
+            size: 0,
             url: url.to_string(),
         })
     }
 
     /// Create from an HTTPS URL pointing to S3-hosted content
+    ///
+    /// # Errors
+    /// Returns an error if the HTTP HEAD request fails or the URL is invalid.
     pub fn from_https(url: &str) -> AnyResult<Self> {
-        // Use HTTP reader under the hood for public S3 buckets
         let http_reader = HttpRangeReader::new(url)?;
 
         Ok(Self {
-            bucket: String::new(),
-            key: String::new(),
             size: http_reader.size,
             url: url.to_string(),
         })
@@ -270,6 +281,9 @@ impl RangeReader for S3RangeReader {
 }
 
 /// Create a range reader from a path or URL
+///
+/// # Errors
+/// Returns an error if the source cannot be opened or is invalid.
 pub fn create_range_reader(source: &str) -> AnyResult<Arc<dyn RangeReader>> {
     if source.starts_with("s3://") {
         // Use the proper S3 reader that supports credentials and custom endpoints

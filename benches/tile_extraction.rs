@@ -10,6 +10,7 @@
 use criterion::{criterion_group, criterion_main, Criterion, BenchmarkId};
 use std::hint::black_box;
 use std::sync::Arc;
+use tokio::runtime::Runtime;
 
 use cogrs::{
     CogReader, BoundingBox, CoordTransformer, PointQuery,
@@ -39,6 +40,7 @@ fn bench_xyz_tile_extraction(c: &mut Criterion) {
         return;
     };
 
+    let rt = Runtime::new().unwrap();
     let reader = LocalRangeReader::new(&path).unwrap();
     let cog = CogReader::from_reader(Arc::new(reader)).unwrap();
 
@@ -56,7 +58,7 @@ fn bench_xyz_tile_extraction(c: &mut Criterion) {
             &(zoom, x, y),
             |b, &(z, x, y)| {
                 b.iter(|| {
-                    extract_xyz_tile(black_box(&cog), z, x, y, (256, 256))
+                    rt.block_on(extract_xyz_tile(black_box(&cog), z, x, y, (256, 256)))
                 });
             },
         );
@@ -72,6 +74,7 @@ fn bench_tile_sizes(c: &mut Criterion) {
         return;
     };
 
+    let rt = Runtime::new().unwrap();
     let reader = LocalRangeReader::new(&path).unwrap();
     let cog = CogReader::from_reader(Arc::new(reader)).unwrap();
 
@@ -84,7 +87,7 @@ fn bench_tile_sizes(c: &mut Criterion) {
             &size,
             |b, &size| {
                 b.iter(|| {
-                    extract_tile_with_extent(black_box(&cog), &extent, (size, size))
+                    rt.block_on(extract_tile_with_extent(black_box(&cog), &extent, (size, size)))
                 });
             },
         );

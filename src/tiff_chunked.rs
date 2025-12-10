@@ -3,7 +3,7 @@ use crate::tiff_utils::{
     AnyResult, TAG_GDAL_METADATA, parse_gdal_metadata_stats, read_ifd, read_tag_string_from_ifd,
     read_tiff_header,
 };
-use crate::tile_cache::{self, TileKind};
+use crate::tile_cache;
 use std::fs::File;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -25,6 +25,8 @@ pub struct TiffChunkedRasterSource {
 }
 
 impl TiffChunkedRasterSource {
+    /// # Errors
+    /// Returns an error if the file cannot be opened or is not a valid tiled TIFF.
     pub fn open(path: &PathBuf) -> AnyResult<Self> {
         let mut decoder = Decoder::new(File::open(path)?)?;
         decoder = decoder.with_limits(Limits::unlimited());
@@ -163,7 +165,7 @@ impl TiffChunkedRasterSource {
             };
 
             for neighbor in neighbors {
-                if tile_cache::contains_legacy(&config.path, TileKind::Chunked, neighbor) {
+                if tile_cache::contains_by_path(&config.path, neighbor) {
                     continue;
                 }
 
@@ -176,7 +178,7 @@ impl TiffChunkedRasterSource {
                         cfg.chunk_height,
                         cfg.samples_per_pixel,
                     ) {
-                        tile_cache::insert_legacy(&cfg.path, TileKind::Chunked, neighbor, tile);
+                        tile_cache::insert_by_path(&cfg.path, neighbor, tile);
                     }
                 });
             }
@@ -194,17 +196,12 @@ impl TiffChunkedRasterSource {
     }
 
     fn fetch_chunk(&self, chunk_index: usize) -> AnyResult<Arc<Vec<f32>>> {
-        if let Some(entry) = tile_cache::get_legacy(&self.path, TileKind::Chunked, chunk_index) {
+        if let Some(entry) = tile_cache::get_by_path(&self.path, chunk_index) {
             return Ok(entry);
         }
 
         let entry = self.load_chunk(chunk_index)?;
-        tile_cache::insert_legacy(
-            &self.path,
-            TileKind::Chunked,
-            chunk_index,
-            Arc::clone(&entry),
-        );
+        tile_cache::insert_by_path(&self.path, chunk_index, Arc::clone(&entry));
         self.prefetch_neighbors(chunk_index);
         Ok(entry)
     }
@@ -217,6 +214,11 @@ impl TiffChunkedRasterSource {
         self.tiepoint
     }
 
+    /// # Errors
+    /// Returns an error if chunk reading fails.
+    ///
+    /// # Panics
+    /// Panics if the mutex lock is poisoned.
     pub fn compute_min_max(&self) -> AnyResult<(f32, f32)> {
         if let Some(result) = *self.min_max.lock().unwrap() {
             return Ok(result);
@@ -281,9 +283,8 @@ impl RasterSource for TiffChunkedRasterSource {
             return None;
         }
 
-        let chunk = match self.fetch_chunk(chunk_index) {
-            Ok(entry) => entry,
-            Err(_) => return None,
+        let Ok(chunk) = self.fetch_chunk(chunk_index) else {
+            return None;
         };
 
         let offset = (within_y * self.chunk_width + within_x) * self.samples_per_pixel + band;
@@ -295,14 +296,21 @@ fn convert_decoding_result(result: DecodingResult) -> Vec<f32> {
     match result {
         DecodingResult::U8(data) => data.into_iter().map(f32::from).collect(),
         DecodingResult::U16(data) => data.into_iter().map(f32::from).collect(),
+        // Allow precision loss: converting large integers to f32 for visualization purposes
+        #[allow(clippy::cast_precision_loss)]
         DecodingResult::U32(data) => data.into_iter().map(|v| v as f32).collect(),
         DecodingResult::I8(data) => data.into_iter().map(f32::from).collect(),
         DecodingResult::I16(data) => data.into_iter().map(f32::from).collect(),
+        #[allow(clippy::cast_precision_loss)]
         DecodingResult::I32(data) => data.into_iter().map(|v| v as f32).collect(),
         DecodingResult::F32(data) => data,
+        // Allow truncation: converting f64 to f32 for performance reasons
+        #[allow(clippy::cast_possible_truncation)]
         DecodingResult::F64(data) => data.into_iter().map(|v| v as f32).collect(),
         DecodingResult::F16(data) => data.into_iter().map(f32::from).collect(),
+        #[allow(clippy::cast_precision_loss)]
         DecodingResult::U64(data) => data.into_iter().map(|v| v as f32).collect(),
+        #[allow(clippy::cast_precision_loss)]
         DecodingResult::I64(data) => data.into_iter().map(|v| v as f32).collect(),
     }
 }
@@ -322,14 +330,17 @@ fn load_chunk_with_config(
     chunk_height: usize,
     samples_per_pixel: usize,
 ) -> AnyResult<Arc<Vec<f32>>> {
-    let decoder = Decoder::new(File::open(path)?)?;
-    let mut decoder = decoder.with_limits(Limits::unlimited());
+    let file_decoder = Decoder::new(File::open(path)?)?;
+    let mut decoder = file_decoder.with_limits(Limits::unlimited());
+    // Cast is safe: chunk_index is derived from tile grid dimensions
+    #[allow(clippy::cast_possible_truncation)]
     let data_dims = decoder.chunk_data_dimensions(chunk_index as u32);
     let actual_width = data_dims.0 as usize;
     let actual_height = data_dims.1 as usize;
 
-    let decoded = decoder.read_chunk(chunk_index as u32)?;
-    let values = convert_decoding_result(decoded);
+    #[allow(clippy::cast_possible_truncation)]
+    let chunk_data = decoder.read_chunk(chunk_index as u32)?;
+    let values = convert_decoding_result(chunk_data);
     let expected_len = actual_width * actual_height * samples_per_pixel;
     if values.len() != expected_len {
         return Err(format!(

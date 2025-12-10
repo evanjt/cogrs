@@ -1,6 +1,6 @@
 //! Local filesystem COG source.
 //!
-//! Scans directories for GeoTIFF files and extracts metadata.
+//! Scans directories for `GeoTIFF` files and extracts metadata.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -21,7 +21,7 @@ pub struct LocalScanOptions {
     pub min_depth: usize,
     /// Maximum directory depth to scan (None = unlimited)
     pub max_depth: Option<usize>,
-    /// File extensions to consider as GeoTIFFs (case-insensitive)
+    /// File extensions to consider as `GeoTIFFs` (case-insensitive)
     pub extensions: Vec<String>,
     /// Whether to follow symbolic links
     pub follow_links: bool,
@@ -45,6 +45,7 @@ impl Default for LocalScanOptions {
 
 impl LocalScanOptions {
     /// Create options that only scan immediate subdirectories (like tileyolo's layer structure)
+    #[must_use] 
     pub fn layers() -> Self {
         Self {
             min_depth: 2, // layer/file.tif pattern
@@ -53,17 +54,20 @@ impl LocalScanOptions {
     }
 
     /// Create options for recursive scanning with no depth limit
+    #[must_use] 
     pub fn recursive() -> Self {
         Self::default()
     }
 
     /// Set minimum depth
+    #[must_use] 
     pub fn with_min_depth(mut self, depth: usize) -> Self {
         self.min_depth = depth;
         self
     }
 
     /// Set maximum depth
+    #[must_use] 
     pub fn with_max_depth(mut self, depth: usize) -> Self {
         self.max_depth = Some(depth);
         self
@@ -72,21 +76,24 @@ impl LocalScanOptions {
 
 /// COG source that scans local directories.
 ///
-/// Discovers GeoTIFF files in a directory tree and extracts metadata from each.
+/// Discovers `GeoTIFF` files in a directory tree and extracts metadata from each.
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use cogrs::source::{LocalCogSource, LocalScanOptions};
+/// ```rust,no_run
+/// use cogrs::source::{CogSource, LocalCogSource, LocalScanOptions};
 ///
-/// // Scan with default options (recursive)
-/// let source = LocalCogSource::scan("/path/to/data", LocalScanOptions::default())?;
+/// fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+///     // Scan with default options (recursive)
+///     let source = LocalCogSource::scan("/path/to/data", &LocalScanOptions::default())?;
 ///
-/// // Or scan layer-style directories (depth=2)
-/// let source = LocalCogSource::scan("/path/to/layers", LocalScanOptions::layers())?;
+///     // Or scan layer-style directories (depth=2)
+///     let source = LocalCogSource::scan("/path/to/layers", &LocalScanOptions::layers())?;
 ///
-/// for entry in source.entries() {
-///     println!("Found: {} ({} bands)", entry.name, entry.bands);
+///     for entry in source.entries() {
+///         println!("Found: {} ({} bands)", entry.name, entry.bands);
+///     }
+///     Ok(())
 /// }
 /// ```
 pub struct LocalCogSource {
@@ -103,9 +110,12 @@ impl LocalCogSource {
     ///
     /// # Returns
     /// A `LocalCogSource` containing metadata for all discovered COGs.
+    ///
+    /// # Errors
+    /// Returns an error if the root directory does not exist or cannot be read.
     pub fn scan<P: AsRef<Path>>(
         root: P,
-        options: LocalScanOptions,
+        options: &LocalScanOptions,
     ) -> Result<Self, Box<dyn std::error::Error + Send + Sync>> {
         let root = root.as_ref();
         if !root.exists() {
@@ -125,19 +135,18 @@ impl LocalCogSource {
         }
 
         // Scan for files
-        for entry in walker.into_iter().filter_map(|e| e.ok()) {
+        for entry in walker.into_iter().filter_map(std::result::Result::ok) {
             let path = entry.path();
 
             // Check extension
             let ext = path
                 .extension()
                 .and_then(|s| s.to_str())
-                .map(|s| s.to_lowercase());
+                .map(str::to_lowercase);
 
             let is_geotiff = ext
                 .as_ref()
-                .map(|e| options.extensions.iter().any(|x| x.eq_ignore_ascii_case(e)))
-                .unwrap_or(false);
+                .is_some_and(|e| options.extensions.iter().any(|x| x.eq_ignore_ascii_case(e)));
 
             if !is_geotiff {
                 continue;
@@ -188,10 +197,11 @@ impl LocalCogSource {
             Some(size_bytes),
             last_modified,
         )
-        .map_err(|e| e.into())
+        .map_err(std::convert::Into::into)
     }
 
     /// Get the root directory that was scanned.
+    #[must_use] 
     pub fn root(&self) -> Option<&Path> {
         self.entries.first().and_then(|e| match &e.location {
             CogLocation::Local(p) => p.parent(),
@@ -200,6 +210,7 @@ impl LocalCogSource {
     }
 
     /// Get statistics about discovered COGs.
+    #[must_use] 
     pub fn stats(&self) -> LocalSourceStats {
         let total_size: u64 = self.entries.iter().filter_map(|e| e.size_bytes).sum();
         let tiled_count = self.entries.iter().filter(|e| e.is_tiled).count();
@@ -239,8 +250,11 @@ pub struct LocalSourceStats {
 
 impl LocalSourceStats {
     /// Get total size in megabytes
+    #[must_use]
     pub fn total_size_mb(&self) -> f64 {
-        self.total_size_bytes as f64 / 1024.0 / 1024.0
+        // Allow cast precision loss: file sizes in MB don't need exact precision
+        #[allow(clippy::cast_precision_loss)]
+        { self.total_size_bytes as f64 / 1024.0 / 1024.0 }
     }
 }
 
@@ -264,7 +278,7 @@ mod tests {
 
     #[test]
     fn test_scan_nonexistent_dir() {
-        let result = LocalCogSource::scan("/nonexistent/path", LocalScanOptions::default());
+        let result = LocalCogSource::scan("/nonexistent/path", &LocalScanOptions::default());
         assert!(result.is_err());
     }
 }

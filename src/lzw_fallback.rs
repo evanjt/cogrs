@@ -10,7 +10,7 @@ use crate::tiff_utils::{
     read_tag_f64_six, read_tag_f64_triplet, read_tag_string_from_ifd, read_tag_u32,
     read_tag_u32_vec, read_tag_u32_vec_optional, read_tiff_header,
 };
-use crate::tile_cache::{self, TileKind};
+use crate::tile_cache;
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -38,6 +38,10 @@ pub struct LzwRasterSource {
 }
 
 impl LzwRasterSource {
+    /// # Errors
+    /// Returns an error if the file cannot be opened, is not a valid LZW-compressed TIFF,
+    /// or uses unsupported features (e.g., non-chunky pixels, unsupported bit depths).
+    #[allow(clippy::too_many_lines)] // LZW decompression is naturally sequential; splitting would harm readability
     pub fn open(path: &PathBuf) -> AnyResult<Self> {
         let mut file = File::open(path)?;
         let header = read_tiff_header(&mut file)?;
@@ -321,6 +325,11 @@ impl LzwRasterSource {
         self.model_tiepoint
     }
 
+    /// # Errors
+    /// Returns an error if tile reading or decompression fails.
+    ///
+    /// # Panics
+    /// Panics if the mutex lock is poisoned.
     pub fn compute_min_max(&self) -> AnyResult<(f32, f32)> {
         if let Some(result) = *self.min_max.lock().unwrap() {
             return Ok(result);
@@ -328,6 +337,8 @@ impl LzwRasterSource {
 
         let mut min_value = f32::INFINITY;
         let mut max_value = f32::NEG_INFINITY;
+        // Allow truncation: nodata values are typically simple integers
+        #[allow(clippy::cast_possible_truncation)]
         let nodata_f32 = self.nodata.map(|v| v as f32);
 
         for tile_index in 0..self.offsets.len() {
@@ -362,12 +373,12 @@ impl LzwRasterSource {
     }
 
     fn fetch_tile(&self, tile_index: usize) -> AnyResult<Arc<Vec<f32>>> {
-        if let Some(cached) = tile_cache::get_legacy(&self.path, TileKind::Lzw, tile_index) {
+        if let Some(cached) = tile_cache::get_by_path(&self.path, tile_index) {
             return Ok(cached);
         }
 
         let tile = self.load_tile(tile_index)?;
-        tile_cache::insert_legacy(&self.path, TileKind::Lzw, tile_index, Arc::clone(&tile));
+        tile_cache::insert_by_path(&self.path, tile_index, Arc::clone(&tile));
         self.prefetch_neighbors(tile_index);
         Ok(tile)
     }
@@ -422,7 +433,7 @@ impl LzwRasterSource {
             };
 
             for neighbor in neighbors {
-                if tile_cache::contains_legacy(&config.path, TileKind::Lzw, neighbor) {
+                if tile_cache::contains_by_path(&config.path, neighbor) {
                     continue;
                 }
 
@@ -439,7 +450,7 @@ impl LzwRasterSource {
                         cfg.bytes_per_sample,
                         neighbor,
                     ) {
-                        tile_cache::insert_legacy(&cfg.path, TileKind::Lzw, neighbor, tile);
+                        tile_cache::insert_by_path(&cfg.path, neighbor, tile);
                     }
                 });
             }
@@ -496,6 +507,8 @@ impl RasterSource for LzwRasterSource {
     }
 }
 
+/// # Errors
+/// Returns an error if the file cannot be opened or is not a valid LZW-compressed TIFF.
 pub fn try_read_lzw_tiff_fallback(path: &PathBuf) -> AnyResult<LzwRasterSource> {
     LzwRasterSource::open(path)
 }
@@ -580,8 +593,10 @@ fn apply_horizontal_predictor_u16(
 }
 
 /// Apply floating-point predictor (predictor=3).
-/// Unlike predictor 2, this operates on bytes at the same position within
-/// each sample (e.g., all high bytes together, all low bytes together).
+/// This uses a two-step process per the Adobe TIFF Technote 3:
+/// 1. Input data is stored "planar" - all MSBs together, then next bytes, etc.
+/// 2. Horizontal differencing is applied within each byte plane
+/// We need to reverse this: undo differencing, then reorder to interleaved.
 fn apply_floating_point_predictor(
     data: &mut [u8],
     tile_width: usize,
@@ -596,24 +611,50 @@ fn apply_floating_point_predictor(
     let samples_per_row = tile_width * samples_per_pixel;
     let bytes_per_row = samples_per_row * bytes_per_sample;
 
+    // Step 1: Reverse horizontal differencing on each byte plane
     for row in 0..tile_length {
         let row_start = row * bytes_per_row;
-        let row_end = row_start + bytes_per_row;
-        if row_end > data.len() {
+        if row_start + bytes_per_row > data.len() {
             break;
         }
 
-        // Process each byte position independently across all samples
-        for byte_pos in 0..bytes_per_sample {
-            for sample_idx in 1..samples_per_row {
-                let idx = row_start + sample_idx * bytes_per_sample + byte_pos;
-                let prev_idx = row_start + (sample_idx - 1) * bytes_per_sample + byte_pos;
+        for byte_plane in 0..bytes_per_sample {
+            let plane_start = row_start + byte_plane * samples_per_row;
+            for i in 1..samples_per_row {
+                let idx = plane_start + i;
+                let prev_idx = plane_start + i - 1;
                 if idx < data.len() && prev_idx < data.len() {
                     data[idx] = data[idx].wrapping_add(data[prev_idx]);
                 }
             }
         }
     }
+
+    // Step 2: Reorder from planar to interleaved
+    // Planar: [B0_s0, B0_s1, ..., B1_s0, B1_s1, ..., B2_s0, ...]
+    // Interleaved: [B0_s0, B1_s0, B2_s0, B3_s0, B0_s1, B1_s1, ...]
+    let mut output = vec![0u8; data.len()];
+    for row in 0..tile_length {
+        let row_start = row * bytes_per_row;
+        if row_start + bytes_per_row > data.len() {
+            break;
+        }
+
+        for sample_idx in 0..samples_per_row {
+            for byte_pos in 0..bytes_per_sample {
+                // Source: planar layout
+                let src_idx = row_start + byte_pos * samples_per_row + sample_idx;
+                // Dest: interleaved layout (big-endian byte order for floats)
+                let dst_idx = row_start + sample_idx * bytes_per_sample + (bytes_per_sample - 1 - byte_pos);
+                if src_idx < data.len() && dst_idx < output.len() {
+                    output[dst_idx] = data[src_idx];
+                }
+            }
+        }
+    }
+
+    // Copy back to original buffer
+    data.copy_from_slice(&output);
 }
 
 #[derive(Clone)]

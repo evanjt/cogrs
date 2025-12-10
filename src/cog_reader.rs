@@ -83,7 +83,9 @@ impl CogDataType {
     }
 
     /// Detect data type from TIFF tags
-    #[must_use] pub fn from_tags(bits_per_sample: u16, sample_format: u16) -> Option<Self> {
+    #[must_use]
+    #[allow(clippy::match_same_arms)] // False positive: default fallback patterns have different semantics
+    pub fn from_tags(bits_per_sample: u16, sample_format: u16) -> Option<Self> {
         match (sample_format, bits_per_sample) {
             (SAMPLE_FORMAT_UINT, 8) => Some(CogDataType::UInt8),
             (SAMPLE_FORMAT_UINT, 16) => Some(CogDataType::UInt16),
@@ -136,6 +138,9 @@ pub struct GeoTransform {
     pub pixel_scale: Option<[f64; 3]>,
     /// Tiepoint (i, j, k, x, y, z) - maps pixel (i,j,k) to world (x,y,z)
     pub tiepoint: Option<[f64; 6]>,
+    /// Whether the dataset uses "Point" registration (pixel centers) vs "Area" (pixel corners)
+    /// When true, GDAL applies a half-pixel shift to the geotransform origin
+    pub is_point_registered: bool,
 }
 
 impl GeoTransform {
@@ -144,8 +149,12 @@ impl GeoTransform {
         let scale = self.pixel_scale?;
         let tie = self.tiepoint?;
 
-        let world_x = tie[3] + (px - tie[0]) * scale[0];
-        let world_y = tie[4] - (py - tie[1]) * scale[1]; // Y is typically inverted
+        // Apply half-pixel shift for Point registration (GDAL convention)
+        // When is_point_registered=true, tiepoint refers to pixel center, not corner
+        let offset = if self.is_point_registered { 0.5 } else { 0.0 };
+
+        let world_x = tie[3] + (px + offset - tie[0]) * scale[0];
+        let world_y = tie[4] - (py + offset - tie[1]) * scale[1]; // Y is typically inverted
 
         Some((world_x, world_y))
     }
@@ -159,17 +168,23 @@ impl GeoTransform {
             return None;
         }
 
-        let px = tie[0] + (wx - tie[3]) / scale[0];
-        let py = tie[1] + (tie[4] - wy) / scale[1]; // Y is typically inverted
+        // Apply half-pixel shift for Point registration (GDAL convention)
+        // When is_point_registered=true, we need to shift by +0.5 pixel to match GDAL
+        let offset = if self.is_point_registered { 0.5 } else { 0.0 };
+
+        let px = tie[0] + (wx - tie[3]) / scale[0] + offset;
+        let py = tie[1] + (tie[4] - wy) / scale[1] + offset; // Y is typically inverted
 
         Some((px, py))
     }
 
     /// Get the world extent of the image
     #[must_use] pub fn get_extent(&self, width: usize, height: usize) -> Option<(f64, f64, f64, f64)> {
-        let (minx, maxy) = self.pixel_to_world(0.0, 0.0)?;
-        let (maxx, miny) = self.pixel_to_world(width as f64, height as f64)?;
-        Some((minx, miny, maxx, maxy))
+        let (min_x, max_y) = self.pixel_to_world(0.0, 0.0)?;
+        // Safe cast: usize to f64 precision loss is acceptable for image dimensions (typically < 2^24 pixels)
+        #[allow(clippy::cast_precision_loss)]
+        let (max_x, min_y) = self.pixel_to_world(width as f64, height as f64)?;
+        Some((min_x, min_y, max_x, max_y))
     }
 }
 
@@ -314,18 +329,21 @@ pub enum OverviewQualityHint {
 impl OverviewQualityHint {
     /// Convert from database representation (`Option<i32>`)
     ///
-    /// - `None` -> ComputeAtRuntime (legacy layers without pre-computed value)
-    /// - `Some(-1)` -> NoneUsable (force full resolution)
-    /// - `Some(-2)` -> AllUsable (all overviews are good)
+    /// - `None` -> `ComputeAtRuntime` (legacy layers without pre-computed value)
+    /// - `Some(-1)` -> `NoneUsable` (force full resolution)
+    /// - `Some(-2)` -> `AllUsable` (all overviews are good)
     /// - `Some(n)` where n >= 0 -> MinUsable(n as usize)
     #[must_use]
     pub fn from_db_value(value: Option<i32>) -> Self {
         match value {
-            None => Self::ComputeAtRuntime,
-            Some(-1) => Self::NoneUsable,
             Some(-2) => Self::AllUsable,
-            Some(n) if n >= 0 => Self::MinUsable(n as usize),
-            Some(_) => Self::ComputeAtRuntime, // Invalid value, fall back to runtime
+            Some(-1) => Self::NoneUsable,
+            Some(n) if n >= 0 => {
+                // Safe cast: n is validated to be non-negative, and overview indices are always small (<100)
+                #[allow(clippy::cast_sign_loss)]
+                Self::MinUsable(n as usize)
+            }
+            None | Some(_) => Self::ComputeAtRuntime, // None or invalid value, fall back to runtime
         }
     }
 
@@ -336,7 +354,11 @@ impl OverviewQualityHint {
             Self::ComputeAtRuntime => None,
             Self::NoneUsable => Some(-1),
             Self::AllUsable => Some(-2),
-            Self::MinUsable(n) => Some(*n as i32),
+            Self::MinUsable(n) => {
+                // Safe cast: overview indices are always small (<100), well within i32 range
+                #[allow(clippy::cast_possible_wrap, clippy::cast_possible_truncation)]
+                Some(*n as i32)
+            }
         }
     }
 }
@@ -354,6 +376,10 @@ pub struct CogReader {
 
 impl CogReader {
     /// Open a COG from any source (local file, HTTP URL, or S3)
+    ///
+    /// # Errors
+    /// Returns an error if the source cannot be read, the file is not a valid TIFF/COG,
+    /// or required metadata tags are missing or invalid.
     pub fn open(source: &str) -> AnyResult<Self> {
         let reader = create_range_reader(source)?;
         Self::from_reader(reader)
@@ -363,12 +389,20 @@ impl CogReader {
     ///
     /// Use this when you have pre-computed the overview quality (e.g., stored in a database)
     /// to skip the expensive runtime analysis that samples tiles.
+    ///
+    /// # Errors
+    /// Returns an error if the source cannot be read, the file is not a valid TIFF/COG,
+    /// or required metadata tags are missing or invalid.
     pub fn open_with_hint(source: &str, hint: OverviewQualityHint) -> AnyResult<Self> {
         let reader = create_range_reader(source)?;
         Self::from_reader_with_hint(reader, hint)
     }
 
     /// Open from an existing range reader
+    ///
+    /// # Errors
+    /// Returns an error if the file is not a valid TIFF/COG, or required metadata tags
+    /// are missing or invalid.
     pub fn from_reader(reader: Arc<dyn RangeReader>) -> AnyResult<Self> {
         Self::from_reader_with_hint(reader, OverviewQualityHint::ComputeAtRuntime)
     }
@@ -385,6 +419,10 @@ impl CogReader {
     ///   - `AllUsable`: All overviews have sufficient data
     ///   - `NoneUsable`: No overviews are usable, always use full resolution
     ///   - `MinUsable(n)`: Overviews 0..=n are usable
+    ///
+    /// # Errors
+    /// Returns an error if the file is not a valid TIFF/COG, required metadata tags
+    /// are missing or invalid, or if reading the IFD data fails.
     pub fn from_reader_with_hint(reader: Arc<dyn RangeReader>, hint: OverviewQualityHint) -> AnyResult<Self> {
         // Read header to get IFD offset and byte order
         let header_bytes = reader.read_range(0, 8)?;
@@ -405,6 +443,8 @@ impl CogReader {
 
         // Read IFD entries - estimate size based on typical COG (usually < 4KB)
         // Clamp to available bytes if IFD is near end of file
+        // Safe cast: clamped to 4096, well within usize range on all platforms
+        #[allow(clippy::cast_possible_truncation)]
         let ifd_size_estimate = 4096.min((file_size - u64::from(ifd_offset)) as usize);
         let ifd_bytes = reader.read_range(u64::from(ifd_offset), ifd_size_estimate)?;
 
@@ -416,6 +456,8 @@ impl CogReader {
         let full_width = metadata.width;
 
         while current_ifd_offset != 0 {
+            // Safe cast: clamped to 4096, well within usize range on all platforms
+            #[allow(clippy::cast_possible_truncation)]
             let ovr_ifd_size = 4096.min((file_size - u64::from(current_ifd_offset)) as usize);
             let ovr_ifd_bytes = reader.read_range(u64::from(current_ifd_offset), ovr_ifd_size)?;
 
@@ -516,7 +558,7 @@ impl CogReader {
         }
     }
 
-    /// Internal: Run overview analysis and set min_usable_overview
+    /// Internal: Run overview analysis and set `min_usable_overview`
     fn analyze_overview_quality(&mut self) {
         self.min_usable_overview = self.analyze_overview_quality_impl();
     }
@@ -559,7 +601,10 @@ impl CogReader {
             }
 
             let density = if total_pixels > 0 {
-                valid_pixels as f64 / total_pixels as f64
+                // Safe cast: usize to f64 precision loss acceptable for pixel counts (ratios still accurate)
+                #[allow(clippy::cast_precision_loss)]
+                let density_value = valid_pixels as f64 / total_pixels as f64;
+                density_value
             } else {
                 0.0
             };
@@ -596,7 +641,10 @@ impl CogReader {
         // Calculate how many source pixels per output pixel we'd need at full res
         // If extent covers 21600 source pixels but we only output 256 pixels, we can use an 84x overview
         // If extent covers 256 source pixels for 256 output, we need full resolution (scale = 1)
+        // Safe cast: usize to f64 precision loss acceptable for extent size calculations
+        #[allow(clippy::cast_precision_loss)]
         let scale_x = extent_src_width as f64 / output_size;
+        #[allow(clippy::cast_precision_loss)]
         let scale_y = extent_src_height as f64 / output_size;
         let needed_scale = scale_x.max(scale_y);
 
@@ -624,6 +672,8 @@ impl CogReader {
             // We can use it if the overview has at least as many pixels as we need
             // needed_scale = extent_pixels / output_pixels
             // If needed_scale = 84 and overview scale = 64, overview has enough resolution
+            // Safe cast: needed_scale is always positive (checked above) and represents overview scale (<1000)
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
             if ovr.scale <= (needed_scale as usize) && ovr.scale > best_scale {
                 best_scale = ovr.scale;
                 best_idx = Some(idx);
@@ -635,6 +685,10 @@ impl CogReader {
 
     /// Read a tile from a specific overview level
     /// Uses global LRU cache to avoid re-decompressing tiles
+    ///
+    /// # Errors
+    /// Returns an error if the overview or tile index is out of range, if reading tile data fails,
+    /// or if decompression fails.
     pub fn read_overview_tile(&self, overview_idx: usize, tile_index: usize) -> AnyResult<Vec<f32>> {
         let source_id = self.reader.identifier();
 
@@ -655,6 +709,8 @@ impl CogReader {
         }
 
         let offset = ovr.tile_offsets[tile_index];
+        // Safe cast: tile byte counts are always < 100MB, well within usize range
+        #[allow(clippy::cast_possible_truncation)]
         let byte_count = ovr.tile_byte_counts[tile_index] as usize;
 
         if byte_count == 0 {
@@ -685,7 +741,7 @@ impl CogReader {
             &unpredicted,
             self.metadata.data_type,
             self.metadata.little_endian,
-        )?;
+        );
 
         // Cache the result
         tile_cache::insert(source_id, tile_index, Some(overview_idx), Arc::new(result.clone()));
@@ -695,6 +751,10 @@ impl CogReader {
 
     /// Read a single tile's raw data and decompress
     /// Uses global LRU cache to avoid re-decompressing tiles
+    ///
+    /// # Errors
+    /// Returns an error if the tile index is out of range, if reading tile data fails,
+    /// or if decompression fails.
     pub fn read_tile(&self, tile_index: usize) -> AnyResult<Vec<f32>> {
         let source_id = self.reader.identifier();
 
@@ -713,6 +773,8 @@ impl CogReader {
         }
 
         let offset = self.metadata.tile_offsets[tile_index];
+        // Safe cast: tile byte counts are always < 100MB, well within usize range
+        #[allow(clippy::cast_possible_truncation)]
         let byte_count = self.metadata.tile_byte_counts[tile_index] as usize;
 
         if byte_count == 0 {
@@ -747,7 +809,7 @@ impl CogReader {
             &unpredicted,
             self.metadata.data_type,
             self.metadata.little_endian,
-        )?;
+        );
 
         // Cache the result
         tile_cache::insert(source_id, tile_index, None, Arc::new(result.clone()));
@@ -756,8 +818,12 @@ impl CogReader {
     }
 
     /// Read a single tile and return both data and bytes fetched from source
-    /// Returns (pixel_data, bytes_fetched) where bytes_fetched is the compressed size read from source
-    /// If tile was cached, bytes_fetched is 0 (no network I/O)
+    /// Returns (`pixel_data`, `bytes_fetched`) where `bytes_fetched` is the compressed size read from source
+    /// If tile was cached, `bytes_fetched` is 0 (no network I/O)
+    ///
+    /// # Errors
+    /// Returns an error if the tile index is out of range, if reading tile data fails,
+    /// or if decompression fails.
     pub fn read_tile_with_bytes(&self, tile_index: usize) -> AnyResult<(Vec<f32>, usize)> {
         let source_id = self.reader.identifier();
 
@@ -775,6 +841,8 @@ impl CogReader {
         }
 
         let offset = self.metadata.tile_offsets[tile_index];
+        // Safe cast: tile byte counts are always < 100MB, well within usize range
+        #[allow(clippy::cast_possible_truncation)]
         let byte_count = self.metadata.tile_byte_counts[tile_index] as usize;
 
         if byte_count == 0 {
@@ -805,7 +873,7 @@ impl CogReader {
             &unpredicted,
             self.metadata.data_type,
             self.metadata.little_endian,
-        )?;
+        );
 
         tile_cache::insert(source_id, tile_index, None, Arc::new(result.clone()));
 
@@ -813,8 +881,12 @@ impl CogReader {
     }
 
     /// Read an overview tile and return both data and bytes fetched from source
-    /// Returns (pixel_data, bytes_fetched) where bytes_fetched is the compressed size read from source
-    /// If tile was cached, bytes_fetched is 0 (no network I/O)
+    /// Returns (`pixel_data`, `bytes_fetched`) where `bytes_fetched` is the compressed size read from source
+    /// If tile was cached, `bytes_fetched` is 0 (no network I/O)
+    ///
+    /// # Errors
+    /// Returns an error if the overview or tile index is out of range, if reading tile data fails,
+    /// or if decompression fails.
     pub fn read_overview_tile_with_bytes(&self, overview_idx: usize, tile_index: usize) -> AnyResult<(Vec<f32>, usize)> {
         let source_id = self.reader.identifier();
 
@@ -835,6 +907,8 @@ impl CogReader {
         }
 
         let offset = ovr.tile_offsets[tile_index];
+        // Safe cast: tile byte counts are always < 100MB, well within usize range
+        #[allow(clippy::cast_possible_truncation)]
         let byte_count = ovr.tile_byte_counts[tile_index] as usize;
 
         if byte_count == 0 {
@@ -865,7 +939,7 @@ impl CogReader {
             &unpredicted,
             self.metadata.data_type,
             self.metadata.little_endian,
-        )?;
+        );
 
         tile_cache::insert(source_id, tile_index, Some(overview_idx), Arc::new(result.clone()));
 
@@ -873,6 +947,9 @@ impl CogReader {
     }
 
     /// Sample a single pixel value
+    ///
+    /// # Errors
+    /// Returns an error if reading or decompressing the tile containing the pixel fails.
     pub fn sample(&self, band: usize, x: usize, y: usize) -> AnyResult<Option<f32>> {
         let Some(tile_index) = self.metadata.tile_index_for_pixel(x, y) else {
             return Ok(None);
@@ -896,6 +973,9 @@ impl CogReader {
     /// For remote files (S3/HTTP): Samples a few tiles for efficiency
     ///
     /// Use `estimate_min_max_fast()` to always use fast sampling regardless of source.
+    ///
+    /// # Errors
+    /// Returns an error if reading or decompressing tiles fails.
     pub fn estimate_min_max(&self) -> AnyResult<(f32, f32)> {
         // First check for GDAL statistics
         if let (Some(min), Some(max)) = (self.metadata.stats_min, self.metadata.stats_max) {
@@ -913,6 +993,9 @@ impl CogReader {
 
     /// Fast min/max estimation - samples only corner and center tiles
     /// Use this for remote files where full scans are expensive
+    ///
+    /// # Errors
+    /// Returns an error if reading or decompressing tiles fails.
     pub fn estimate_min_max_fast(&self) -> AnyResult<(f32, f32)> {
         // First check for GDAL statistics
         if let (Some(min), Some(max)) = (self.metadata.stats_min, self.metadata.stats_max) {
@@ -1019,13 +1102,18 @@ impl CogReader {
     ///
     /// # Example
     ///
-    /// ```rust,ignore
-    /// let reader = CogReader::open("path/to/cog.tif")?;
-    /// let reader_clone = reader.clone_for_async();
+    /// ```rust,no_run
+    /// use cogrs::CogReader;
     ///
-    /// tokio::spawn(async move {
-    ///     // Use reader_clone in async context
-    /// });
+    /// fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    ///     let reader = CogReader::open("path/to/cog.tif")?;
+    ///     let reader_clone = reader.clone_for_async();
+    ///
+    ///     tokio::spawn(async move {
+    ///         // Use reader_clone in async context
+    ///     });
+    ///     Ok(())
+    /// }
     /// ```
     #[must_use]
     pub fn clone_for_async(&self) -> Self {
@@ -1090,6 +1178,89 @@ fn read_f64(bytes: &[u8], little_endian: bool) -> f64 {
     }
 }
 
+/// Parse tile or strip layout from IFD tags
+///
+/// Returns (`tile_width`, `tile_height`, `tiles_across`, `tiles_down`, `is_tiled`, `tile_offsets`, `tile_byte_counts`)
+#[allow(clippy::type_complexity)] // Return tuple is clear from context and used locally
+fn parse_tile_layout(
+    tags: &HashMap<u16, IfdEntry>,
+    reader: &Arc<dyn RangeReader>,
+    ifd_offset: u64,
+    little_endian: bool,
+    width: usize,
+    height: usize,
+) -> AnyResult<(usize, usize, usize, usize, bool, Vec<u64>, Vec<u64>)> {
+    let has_tile_tags = tags.contains_key(&TAG_TILE_OFFSETS);
+    let has_strip_tags = tags.contains_key(&TAG_STRIP_OFFSETS);
+    let is_tiled = has_tile_tags;
+
+    if is_tiled {
+        // Tiled TIFF (COG-optimized)
+        // Safe casts: tile dimensions are always < 10000, well within u32/usize range
+        #[allow(clippy::cast_possible_truncation)]
+        let tw = get_tag_value(tags, TAG_TILE_WIDTH, little_endian).unwrap_or(width as u32) as usize;
+        #[allow(clippy::cast_possible_truncation)]
+        let th = get_tag_value(tags, TAG_TILE_LENGTH, little_endian).unwrap_or(height as u32) as usize;
+        let ta = width.div_ceil(tw);
+        let td = height.div_ceil(th);
+        let total_tiles = ta * td;
+
+        let offsets = read_tag_array_u64(
+            tags,
+            TAG_TILE_OFFSETS,
+            reader,
+            ifd_offset,
+            little_endian,
+            total_tiles,
+        )?;
+
+        let byte_counts = read_tag_array_u64(
+            tags,
+            TAG_TILE_BYTE_COUNTS,
+            reader,
+            ifd_offset,
+            little_endian,
+            total_tiles,
+        )?;
+
+        Ok((tw, th, ta, td, is_tiled, offsets, byte_counts))
+    } else if has_strip_tags {
+        // Stripped TIFF (not COG-optimized)
+        // Treat strips as "tiles" that span the full image width
+        // Safe cast: rows_per_strip is always < image height (<100k), well within usize range
+        #[allow(clippy::cast_possible_truncation)]
+        let rows_per_strip = get_tag_value(tags, TAG_ROWS_PER_STRIP, little_endian)
+            .unwrap_or(height as u32) as usize;
+        let tw = width; // Strip width = image width
+        let th = rows_per_strip;
+        let ta = 1; // Only 1 "tile" across (strips span full width)
+        let td = height.div_ceil(rows_per_strip);
+        let total_strips = td;
+
+        let offsets = read_tag_array_u64(
+            tags,
+            TAG_STRIP_OFFSETS,
+            reader,
+            ifd_offset,
+            little_endian,
+            total_strips,
+        )?;
+
+        let byte_counts = read_tag_array_u64(
+            tags,
+            TAG_STRIP_BYTE_COUNTS,
+            reader,
+            ifd_offset,
+            little_endian,
+            total_strips,
+        )?;
+
+        Ok((tw, th, ta, td, false, offsets, byte_counts))
+    } else {
+        Err("TIFF has neither tile nor strip tags".into())
+    }
+}
+
 /// Parse IFD and extract all COG metadata
 fn parse_ifd(
     ifd_bytes: &[u8],
@@ -1135,10 +1306,16 @@ fn parse_ifd(
     let height = get_tag_value(&tags, TAG_IMAGE_LENGTH, little_endian)
         .ok_or("Missing ImageLength tag")? as usize;
 
+    // Safe casts: these tag values are small constants (<100), well within u16/usize range
+    #[allow(clippy::cast_possible_truncation)]
     let bits_per_sample = get_tag_value(&tags, TAG_BITS_PER_SAMPLE, little_endian).unwrap_or(8) as u16;
+    #[allow(clippy::cast_possible_truncation)]
     let sample_format = get_tag_value(&tags, TAG_SAMPLE_FORMAT, little_endian).unwrap_or(1) as u16;
+    #[allow(clippy::cast_possible_truncation)]
     let bands = get_tag_value(&tags, TAG_SAMPLES_PER_PIXEL, little_endian).unwrap_or(1) as usize;
+    #[allow(clippy::cast_possible_truncation)]
     let compression_val = get_tag_value(&tags, TAG_COMPRESSION, little_endian).unwrap_or(1) as u16;
+    #[allow(clippy::cast_possible_truncation)]
     let predictor = get_tag_value(&tags, TAG_PREDICTOR, little_endian).unwrap_or(1) as u16;
 
     let data_type = CogDataType::from_tags(bits_per_sample, sample_format)
@@ -1147,87 +1324,32 @@ fn parse_ifd(
     let compression = Compression::from_tag(compression_val)
         .ok_or_else(|| format!("Unsupported compression: {compression_val}"))?;
 
-    // Detect if tiled or stripped TIFF
-    let has_tile_tags = tags.contains_key(&TAG_TILE_OFFSETS);
-    let has_strip_tags = tags.contains_key(&TAG_STRIP_OFFSETS);
-    let is_tiled = has_tile_tags;
-
-    // For tiled: use tile dimensions; for stripped: tile_width = image width, tile_height = rows_per_strip
-    let (tile_width, tile_height, tiles_across, tiles_down, tile_offsets, tile_byte_counts) = if is_tiled {
-        // Tiled TIFF (COG-optimized)
-        let tw = get_tag_value(&tags, TAG_TILE_WIDTH, little_endian).unwrap_or(width as u32) as usize;
-        let th = get_tag_value(&tags, TAG_TILE_LENGTH, little_endian).unwrap_or(height as u32) as usize;
-        let ta = width.div_ceil(tw);
-        let td = height.div_ceil(th);
-        let total_tiles = ta * td;
-
-        let offsets = read_tag_array_u64(
-            &tags,
-            TAG_TILE_OFFSETS,
-            reader,
-            ifd_offset,
-            little_endian,
-            total_tiles,
-        )?;
-
-        let byte_counts = read_tag_array_u64(
-            &tags,
-            TAG_TILE_BYTE_COUNTS,
-            reader,
-            ifd_offset,
-            little_endian,
-            total_tiles,
-        )?;
-
-        (tw, th, ta, td, offsets, byte_counts)
-    } else if has_strip_tags {
-        // Stripped TIFF (not COG-optimized)
-        // Treat strips as "tiles" that span the full image width
-        let rows_per_strip = get_tag_value(&tags, TAG_ROWS_PER_STRIP, little_endian)
-            .unwrap_or(height as u32) as usize;
-        let tw = width; // Strip width = image width
-        let th = rows_per_strip;
-        let ta = 1; // Only 1 "tile" across (strips span full width)
-        let td = height.div_ceil(rows_per_strip);
-        let total_strips = td;
-
-        let offsets = read_tag_array_u64(
-            &tags,
-            TAG_STRIP_OFFSETS,
-            reader,
-            ifd_offset,
-            little_endian,
-            total_strips,
-        )?;
-
-        let byte_counts = read_tag_array_u64(
-            &tags,
-            TAG_STRIP_BYTE_COUNTS,
-            reader,
-            ifd_offset,
-            little_endian,
-            total_strips,
-        )?;
-
-        (tw, th, ta, td, offsets, byte_counts)
-    } else {
-        return Err("TIFF has neither tile nor strip tags".into());
-    };
+    // Parse tile or strip layout
+    let (tile_width, tile_height, tiles_across, tiles_down, is_tiled, tile_offsets, tile_byte_counts) =
+        parse_tile_layout(&tags, reader, ifd_offset, little_endian, width, height)?;
 
     // Read geo transform
     let pixel_scale = read_tag_f64_array(&tags, TAG_MODEL_PIXEL_SCALE, reader, ifd_offset, little_endian, 3)?;
     let tiepoint = read_tag_f64_array(&tags, TAG_MODEL_TIEPOINT, reader, ifd_offset, little_endian, 6)?;
 
-    let geo_transform = GeoTransform {
-        pixel_scale: pixel_scale.map(|v| [v[0], v[1], v[2]]),
-        tiepoint: tiepoint.map(|v| [v[0], v[1], v[2], v[3], v[4], v[5]]),
-    };
-
     // Read CRS from GeoKey directory
     let crs_code = read_crs_from_geokeys(&tags, reader, ifd_offset, little_endian)?;
 
-    // Read GDAL statistics
-    let (stats_min, stats_max) = read_gdal_stats(&tags, reader, ifd_offset, little_endian)?;
+    // Check if pixels are Point registered (from GTRasterTypeGeoKey or GDAL metadata)
+    // GeoKey takes precedence as it's the GeoTIFF standard way
+    let is_point_from_geokey = read_raster_type_from_geokeys(&tags, reader, little_endian)?;
+
+    // Read GDAL metadata (stats and AREA_OR_POINT fallback)
+    let (stats_min, stats_max, is_point_from_gdal) = read_gdal_metadata_info(&tags, reader, ifd_offset, little_endian)?;
+
+    // Use GeoKey value if available, otherwise fall back to GDAL metadata
+    let is_point_registered = is_point_from_geokey || is_point_from_gdal;
+
+    let geo_transform = GeoTransform {
+        pixel_scale: pixel_scale.map(|v| [v[0], v[1], v[2]]),
+        tiepoint: tiepoint.map(|v| [v[0], v[1], v[2], v[3], v[4], v[5]]),
+        is_point_registered,
+    };
 
     // Read nodata
     let nodata = read_gdal_nodata(&tags, reader, ifd_offset, little_endian)?;
@@ -1489,32 +1611,18 @@ fn read_tag_f64_array(
     Ok(Some(values))
 }
 
+/// GeoKey constants
+const GEO_KEY_RASTER_TYPE: u16 = 1025;  // GTRasterTypeGeoKey: 1=PixelIsArea, 2=PixelIsPoint
+
 fn read_crs_from_geokeys(
     tags: &HashMap<u16, IfdEntry>,
     reader: &Arc<dyn RangeReader>,
     _ifd_offset: u64,
     little_endian: bool,
 ) -> AnyResult<Option<i32>> {
-    let Some(entry) = tags.get(&TAG_GEO_KEY_DIRECTORY) else {
+    let Some(raw_bytes) = read_geokey_directory(tags, reader, little_endian)? else {
         return Ok(None);
     };
-
-    // GeoKey directory is an array of SHORT values
-    if entry.field_type != 3 {
-        return Ok(None);
-    }
-
-    let total_bytes = entry.count as usize * 2;
-    let raw_bytes = if total_bytes <= 4 {
-        entry.raw_bytes[..total_bytes].to_vec()
-    } else {
-        reader.read_range(u64::from(entry.value_offset), total_bytes)?
-    };
-
-    // Parse GeoKey directory header
-    // Format: KeyDirectoryVersion, KeyRevision, MinorRevision, NumberOfKeys
-    //         KeyID, TIFFTagLocation, Count, Value_Offset
-    //         ...repeated for each key
 
     if raw_bytes.len() < 8 {
         return Ok(None);
@@ -1545,14 +1653,81 @@ fn read_crs_from_geokeys(
     Ok(None)
 }
 
-fn read_gdal_stats(
+/// Read GTRasterTypeGeoKey to determine if pixels are Point or Area registered
+/// Returns true if PixelIsPoint (value = 2), false otherwise (Area or missing)
+fn read_raster_type_from_geokeys(
+    tags: &HashMap<u16, IfdEntry>,
+    reader: &Arc<dyn RangeReader>,
+    little_endian: bool,
+) -> AnyResult<bool> {
+    let Some(raw_bytes) = read_geokey_directory(tags, reader, little_endian)? else {
+        return Ok(false);
+    };
+
+    if raw_bytes.len() < 8 {
+        return Ok(false);
+    }
+
+    let num_keys = read_u16(&raw_bytes[6..8], little_endian) as usize;
+
+    for i in 0..num_keys {
+        let offset = 8 + i * 8;
+        if offset + 8 > raw_bytes.len() {
+            break;
+        }
+
+        let key_id = read_u16(&raw_bytes[offset..], little_endian);
+        let tiff_tag_location = read_u16(&raw_bytes[offset + 2..], little_endian);
+        let _count = read_u16(&raw_bytes[offset + 4..], little_endian);
+        let value = read_u16(&raw_bytes[offset + 6..], little_endian);
+
+        // GTRasterTypeGeoKey (1025): 1 = PixelIsArea, 2 = PixelIsPoint
+        if key_id == GEO_KEY_RASTER_TYPE && tiff_tag_location == 0 {
+            return Ok(value == 2);  // true if PixelIsPoint
+        }
+    }
+
+    Ok(false)
+}
+
+/// Helper to read raw `GeoKey` directory bytes
+fn read_geokey_directory(
+    tags: &HashMap<u16, IfdEntry>,
+    reader: &Arc<dyn RangeReader>,
+    _little_endian: bool,
+) -> AnyResult<Option<Vec<u8>>> {
+    let Some(entry) = tags.get(&TAG_GEO_KEY_DIRECTORY) else {
+        return Ok(None);
+    };
+
+    // GeoKey directory is an array of SHORT values
+    if entry.field_type != 3 {
+        return Ok(None);
+    }
+
+    let total_bytes = entry.count as usize * 2;
+    let raw_bytes = if total_bytes <= 4 {
+        entry.raw_bytes[..total_bytes].to_vec()
+    } else {
+        reader.read_range(u64::from(entry.value_offset), total_bytes)?
+    };
+
+    Ok(Some(raw_bytes))
+}
+
+#[allow(dead_code)]
+fn read_geokey_directory_unused(_little_endian: bool) {}
+
+/// Read GDAL metadata: stats and AREA_OR_POINT
+/// Returns (min, max, is_point_registered)
+fn read_gdal_metadata_info(
     tags: &HashMap<u16, IfdEntry>,
     reader: &Arc<dyn RangeReader>,
     _ifd_offset: u64,
     _little_endian: bool,
-) -> AnyResult<(Option<f32>, Option<f32>)> {
+) -> AnyResult<(Option<f32>, Option<f32>, bool)> {
     let Some(entry) = tags.get(&TAG_GDAL_METADATA) else {
-        return Ok((None, None));
+        return Ok((None, None, false));
     };
 
     // GDAL metadata is ASCII/UTF-8 XML
@@ -1569,17 +1744,26 @@ fn read_gdal_stats(
     let min = extract_gdal_stat(&metadata_str, "STATISTICS_MINIMUM");
     let max = extract_gdal_stat(&metadata_str, "STATISTICS_MAXIMUM");
 
-    Ok((min, max))
+    // Parse AREA_OR_POINT - true if "Point" (pixel centers), false if "Area" or missing
+    let is_point_registered = extract_gdal_str(&metadata_str, "AREA_OR_POINT")
+        .map(|s| s == "Point")
+        .unwrap_or(false);
+
+    Ok((min, max, is_point_registered))
 }
 
 fn extract_gdal_stat(metadata: &str, key: &str) -> Option<f32> {
+    extract_gdal_str(metadata, key)?.parse().ok()
+}
+
+fn extract_gdal_str(metadata: &str, key: &str) -> Option<String> {
     let needle = format!("name=\"{key}\"");
     let pos = metadata.find(&needle)?;
     let rest = &metadata[pos..];
     let start = rest.find('>')? + 1;
     let rest = &rest[start..];
     let end = rest.find('<')?;
-    rest[..end].trim().parse().ok()
+    Some(rest[..end].trim().to_string())
 }
 
 fn read_gdal_nodata(
@@ -1588,9 +1772,8 @@ fn read_gdal_nodata(
     _ifd_offset: u64,
     _little_endian: bool,
 ) -> AnyResult<Option<f64>> {
-    let entry = match tags.get(&TAG_GDAL_NODATA) {
-        Some(e) => e,
-        None => return Ok(None),
+    let Some(entry) = tags.get(&TAG_GDAL_NODATA) else {
+        return Ok(None);
     };
 
     let total_bytes = entry.count as usize;
@@ -1652,7 +1835,7 @@ fn decompress_tile(
             let cursor = Cursor::new(compressed);
             let reader = ImageReader::with_format(cursor, image::ImageFormat::Jpeg);
             let img = reader.decode()
-                .map_err(|e| format!("JPEG decode error: {}", e))?;
+                .map_err(|e| format!("JPEG decode error: {e}"))?;
 
             // Convert to raw bytes based on the image type
             let raw = match img {
@@ -1680,7 +1863,7 @@ fn decompress_tile(
             let cursor = Cursor::new(compressed);
             let reader = ImageReader::with_format(cursor, image::ImageFormat::WebP);
             let img = reader.decode()
-                .map_err(|e| format!("WebP decode error: {}", e))?;
+                .map_err(|e| format!("WebP decode error: {e}"))?;
 
             // Convert to raw bytes based on the image type
             let raw = match img {
@@ -1792,17 +1975,19 @@ fn apply_predictor(
             for row in result.chunks_mut(row_bytes) {
                 match bytes_per_sample {
                     1 => {
-                        // 8-bit samples: simple byte-level accumulation is correct
-                        // since each sample IS a single byte
-                        for i in 1..row.len() {
-                            row[i] = row[i].wrapping_add(row[i - 1]);
+                        // 8-bit samples: accumulate per-band (component) with stride
+                        // For pixel-interleaved RGB: R0 G0 B0 R1 G1 B1 ...
+                        // Each band must accumulate independently:
+                        // R1 = R0 + diff_R1, G1 = G0 + diff_G1, B1 = B0 + diff_B1
+                        for i in bands..row.len() {
+                            row[i] = row[i].wrapping_add(row[i - bands]);
                         }
                     }
                     2 => {
                         // 16-bit samples: must accumulate as u16 to handle carries
-                        // between low and high bytes correctly
-                        for i in 1..samples_per_row {
-                            let prev_offset = (i - 1) * 2;
+                        // between low and high bytes correctly. Accumulate per-band.
+                        for i in bands..samples_per_row {
+                            let prev_offset = (i - bands) * 2;
                             let curr_offset = i * 2;
                             let prev = u16::from_le_bytes([row[prev_offset], row[prev_offset + 1]]);
                             let curr = u16::from_le_bytes([row[curr_offset], row[curr_offset + 1]]);
@@ -1813,9 +1998,9 @@ fn apply_predictor(
                     4 => {
                         // 32-bit samples (includes Float32): accumulate as u32
                         // The bit pattern is treated as an integer for differencing,
-                        // regardless of whether it represents float or int data
-                        for i in 1..samples_per_row {
-                            let prev_offset = (i - 1) * 4;
+                        // regardless of whether it represents float or int data. Accumulate per-band.
+                        for i in bands..samples_per_row {
+                            let prev_offset = (i - bands) * 4;
                             let curr_offset = i * 4;
                             let prev = u32::from_le_bytes([
                                 row[prev_offset], row[prev_offset + 1],
@@ -1832,9 +2017,9 @@ fn apply_predictor(
                     8 => {
                         // 64-bit samples (includes Float64): accumulate as u64
                         // This case is critical for scientific raster data which often
-                        // uses Float64 for precision (e.g., climate/agricultural models)
-                        for i in 1..samples_per_row {
-                            let prev_offset = (i - 1) * 8;
+                        // uses Float64 for precision (e.g., climate/agricultural models). Accumulate per-band.
+                        for i in bands..samples_per_row {
+                            let prev_offset = (i - bands) * 8;
                             let curr_offset = i * 8;
                             let prev = u64::from_le_bytes([
                                 row[prev_offset], row[prev_offset + 1],
@@ -1866,34 +2051,95 @@ fn apply_predictor(
             Ok(result)
         }
 
-        // Predictor 3: Floating-point horizontal differencing
-        // Unlike predictor 2, this operates on bytes at the same position within
-        // each sample (e.g., all high bytes together, all low bytes together).
-        // This exploits the structure of IEEE floating-point representation where
-        // adjacent values often have similar exponent bytes.
+        // Predictor 3: Floating-point horizontal differencing (Adobe TIFF Technote 3)
+        //
+        // IMPORTANT: The predictor is applied ROW BY ROW, not to the entire tile at once!
+        // Each row is processed independently with its own byte-shuffle layout.
+        //
+        // For each row:
+        // 1. Bytes are grouped by position within the float (byte-shuffled):
+        //    [f0b0,f1b0,...,fnb0, f0b1,f1b1,...,fnb1, ...]
+        // 2. Horizontal differencing is applied with stride = samples_per_pixel (bands)
+        // 3. Floats are reassembled by taking bytes from each section
+        //
+        // The tiff crate does this in fix_endianness_and_predict() called per-row.
         3 => {
-            let mut result = data.to_vec();
+            let samples = bands;  // samples_per_pixel, stride for differencing
             let row_bytes = tile_width * bands * bytes_per_sample;
+            let floats_per_row = tile_width * bands;
+            let tile_height = data.len() / row_bytes;
 
-            for row in result.chunks_mut(row_bytes) {
-                // Process each byte position independently across all samples
-                for byte_pos in 0..bytes_per_sample {
-                    for i in 1..(row.len() / bytes_per_sample) {
-                        let idx = i * bytes_per_sample + byte_pos;
-                        let prev_idx = (i - 1) * bytes_per_sample + byte_pos;
-                        row[idx] = row[idx].wrapping_add(row[prev_idx]);
+            let mut output = vec![0u8; data.len()];
+
+            for row_idx in 0..tile_height {
+                let row_start = row_idx * row_bytes;
+                let row_end = row_start + row_bytes;
+
+                // Copy row to work buffer
+                let mut row_data: Vec<u8> = data[row_start..row_end].to_vec();
+
+                // Step 1: Reverse horizontal differencing within this row
+                for i in samples..row_data.len() {
+                    row_data[i] = row_data[i].wrapping_add(row_data[i - samples]);
+                }
+
+                // Step 2: Reassemble floats from quadrant layout within this row
+                // Row is divided into bytes_per_sample sections, each of floats_per_row bytes
+                let output_row_start = row_idx * floats_per_row * bytes_per_sample;
+
+                match bytes_per_sample {
+                    4 => {
+                        for i in 0..floats_per_row {
+                            let b0 = row_data[i];
+                            let b1 = row_data[floats_per_row + i];
+                            let b2 = row_data[floats_per_row * 2 + i];
+                            let b3 = row_data[floats_per_row * 3 + i];
+                            let val = u32::from_be_bytes([b0, b1, b2, b3]);
+                            let out_offset = output_row_start + i * 4;
+                            output[out_offset..out_offset + 4].copy_from_slice(&val.to_ne_bytes());
+                        }
+                    }
+                    8 => {
+                        for i in 0..floats_per_row {
+                            let b0 = row_data[i];
+                            let b1 = row_data[floats_per_row + i];
+                            let b2 = row_data[floats_per_row * 2 + i];
+                            let b3 = row_data[floats_per_row * 3 + i];
+                            let b4 = row_data[floats_per_row * 4 + i];
+                            let b5 = row_data[floats_per_row * 5 + i];
+                            let b6 = row_data[floats_per_row * 6 + i];
+                            let b7 = row_data[floats_per_row * 7 + i];
+                            let val = u64::from_be_bytes([b0, b1, b2, b3, b4, b5, b6, b7]);
+                            let out_offset = output_row_start + i * 8;
+                            output[out_offset..out_offset + 8].copy_from_slice(&val.to_ne_bytes());
+                        }
+                    }
+                    2 => {
+                        for i in 0..floats_per_row {
+                            let b0 = row_data[i];
+                            let b1 = row_data[floats_per_row + i];
+                            let val = u16::from_be_bytes([b0, b1]);
+                            let out_offset = output_row_start + i * 2;
+                            output[out_offset..out_offset + 2].copy_from_slice(&val.to_ne_bytes());
+                        }
+                    }
+                    _ => {
+                        return Err(format!(
+                            "Predictor 3 not supported for {}-byte samples",
+                            bytes_per_sample
+                        ).into());
                     }
                 }
             }
 
-            Ok(result)
+            Ok(output)
         }
 
         _ => Err(format!("Unsupported predictor: {predictor}").into()),
     }
 }
 
-fn convert_to_f32(data: &[u8], data_type: CogDataType, little_endian: bool) -> AnyResult<Vec<f32>> {
+fn convert_to_f32(data: &[u8], data_type: CogDataType, little_endian: bool) -> Vec<f32> {
     let bytes_per_sample = data_type.bytes_per_sample();
     let sample_count = data.len() / bytes_per_sample;
     let mut result = Vec::with_capacity(sample_count);
@@ -1904,7 +2150,11 @@ fn convert_to_f32(data: &[u8], data_type: CogDataType, little_endian: bool) -> A
 
         let value = match data_type {
             CogDataType::UInt8 => f32::from(bytes[0]),
-            CogDataType::Int8 => f32::from(bytes[0] as i8),
+            CogDataType::Int8 => {
+                // Safe cast: reinterpreting u8 bit pattern as i8
+                #[allow(clippy::cast_possible_wrap)]
+                f32::from(bytes[0] as i8)
+            }
             CogDataType::UInt16 => {
                 if little_endian {
                     f32::from(u16::from_le_bytes([bytes[0], bytes[1]]))
@@ -1920,6 +2170,8 @@ fn convert_to_f32(data: &[u8], data_type: CogDataType, little_endian: bool) -> A
                 }
             }
             CogDataType::UInt32 => {
+                // Precision loss acceptable: converting 32-bit int to f32 (mantissa 23 bits)
+                #[allow(clippy::cast_precision_loss)]
                 if little_endian {
                     u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f32
                 } else {
@@ -1927,6 +2179,8 @@ fn convert_to_f32(data: &[u8], data_type: CogDataType, little_endian: bool) -> A
                 }
             }
             CogDataType::Int32 => {
+                // Precision loss acceptable: converting 32-bit int to f32 (mantissa 23 bits)
+                #[allow(clippy::cast_precision_loss)]
                 if little_endian {
                     i32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as f32
                 } else {
@@ -1941,6 +2195,8 @@ fn convert_to_f32(data: &[u8], data_type: CogDataType, little_endian: bool) -> A
                 }
             }
             CogDataType::UInt64 => {
+                // Precision loss acceptable: converting 64-bit int to f32 (mantissa 23 bits)
+                #[allow(clippy::cast_precision_loss)]
                 if little_endian {
                     u64::from_le_bytes([
                         bytes[0], bytes[1], bytes[2], bytes[3],
@@ -1954,6 +2210,8 @@ fn convert_to_f32(data: &[u8], data_type: CogDataType, little_endian: bool) -> A
                 }
             }
             CogDataType::Int64 => {
+                // Precision loss acceptable: converting 64-bit int to f32 (mantissa 23 bits)
+                #[allow(clippy::cast_precision_loss)]
                 if little_endian {
                     i64::from_le_bytes([
                         bytes[0], bytes[1], bytes[2], bytes[3],
@@ -1967,6 +2225,8 @@ fn convert_to_f32(data: &[u8], data_type: CogDataType, little_endian: bool) -> A
                 }
             }
             CogDataType::Float64 => {
+                // Precision loss acceptable: converting f64 to f32
+                #[allow(clippy::cast_possible_truncation)]
                 if little_endian {
                     f64::from_le_bytes([
                         bytes[0], bytes[1], bytes[2], bytes[3],
@@ -1984,12 +2244,106 @@ fn convert_to_f32(data: &[u8], data_type: CogDataType, little_endian: bool) -> A
         result.push(value);
     }
 
-    Ok(result)
+    result
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Debug test comparing our predictor 3 implementation with tiff crate
+    #[test]
+    fn test_compare_with_tiff_crate() {
+        use std::io::BufReader;
+        use std::fs::File;
+
+        let path = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/copernicus_dem_san_francisco.tif");
+        if !std::path::Path::new(path).exists() {
+            println!("Skipping: test file not found");
+            return;
+        }
+
+        // Read with tiff crate (reference implementation)
+        let file = File::open(path).unwrap();
+        let mut decoder = tiff::decoder::Decoder::new(BufReader::new(file)).unwrap();
+        let dims = decoder.dimensions().unwrap();
+        println!("TIFF dimensions: {}x{}", dims.0, dims.1);
+
+        // Check chunk type
+        use tiff::tags::Tag;
+        let has_tile_offsets = decoder.get_tag(Tag::TileOffsets).is_ok();
+        let has_strip_offsets = decoder.get_tag(Tag::StripOffsets).is_ok();
+        println!("Has tile offsets: {}, Has strip offsets: {}", has_tile_offsets, has_strip_offsets);
+
+        if has_tile_offsets {
+            if let Ok(tw) = decoder.get_tag_unsigned::<u32>(Tag::TileWidth) {
+                println!("Tile width from tiff crate: {}", tw);
+            }
+            if let Ok(th) = decoder.get_tag_unsigned::<u32>(Tag::TileLength) {
+                println!("Tile height from tiff crate: {}", th);
+            }
+        }
+
+        let tiff_data = match decoder.read_image().unwrap() {
+            tiff::decoder::DecodingResult::F32(data) => {
+                println!("TIFF crate first 8 values: {:?}", &data[0..8]);
+                data
+            }
+            _ => panic!("Expected f32 data"),
+        };
+
+        // Read with our CogReader
+        let reader = crate::LocalRangeReader::new(path).unwrap();
+        let cog = CogReader::from_reader(std::sync::Arc::new(reader)).unwrap();
+
+        println!("COG metadata: {} x {}, {} bands, predictor={}",
+            cog.metadata.width, cog.metadata.height,
+            cog.metadata.bands, cog.metadata.predictor);
+        println!("Tile size: {} x {}", cog.metadata.tile_width, cog.metadata.tile_height);
+        println!("Compression: {:?}", cog.metadata.compression);
+        println!("is_point_registered: {}", cog.metadata.geo_transform.is_point_registered);
+        println!("tiepoint: {:?}", cog.metadata.geo_transform.tiepoint);
+        println!("pixel_scale: {:?}", cog.metadata.geo_transform.pixel_scale);
+
+        // Debug Berkeley Hills coordinates
+        let lon = -122.24_f64;
+        let lat = 37.88_f64;
+        let (px, py) = cog.metadata.geo_transform.world_to_pixel(lon, lat).unwrap();
+        println!("\nBerkeley Hills ({}, {}):", lon, lat);
+        println!("  pixel: ({}, {})", px, py);
+        println!("  truncated: ({}, {})", px as usize, py as usize);
+
+        // Read first tile with our implementation
+        let our_data = cog.read_tile(0).unwrap();
+        println!("Our first 8 values: {:?}", &our_data[0..8]);
+
+        // Compare first 8 values
+        let tile_size = cog.metadata.tile_width * cog.metadata.tile_height;
+        println!("Our tile has {} values", our_data.len());
+        println!("TIFF tile would have {} values", tile_size);
+
+        // Let's also look at bytes to understand what's happening
+        let expected_bytes: [u8; 4] = 101.38305_f32.to_ne_bytes();
+        let got_bytes: [u8; 4] = our_data[0].to_ne_bytes();
+        println!("Expected first float bytes (native): {:02x} {:02x} {:02x} {:02x}",
+            expected_bytes[0], expected_bytes[1], expected_bytes[2], expected_bytes[3]);
+        println!("Got first float bytes (native): {:02x} {:02x} {:02x} {:02x}",
+            got_bytes[0], got_bytes[1], got_bytes[2], got_bytes[3]);
+
+        // Values should be close (accounting for the fact that tiff crate reads entire image
+        // while we read just the first tile)
+        let tolerance = 0.001;
+        let mut mismatches = 0;
+        for i in 0..std::cmp::min(8, our_data.len()) {
+            let diff = (our_data[i] - tiff_data[i]).abs();
+            if diff > tolerance {
+                println!("Mismatch at {}: ours={} vs tiff={}", i, our_data[i], tiff_data[i]);
+                mismatches += 1;
+            }
+        }
+
+        assert_eq!(mismatches, 0, "Found {} value mismatches vs tiff crate", mismatches);
+    }
 
     #[test]
     fn test_data_type_detection() {
@@ -2012,9 +2366,11 @@ mod tests {
 
     #[test]
     fn test_geo_transform() {
+        // Test Area registration (default, tiepoint = pixel corner)
         let transform = GeoTransform {
             pixel_scale: Some([10.0, 10.0, 0.0]),
             tiepoint: Some([0.0, 0.0, 0.0, 100.0, 200.0, 0.0]),
+            is_point_registered: false,
         };
 
         // Pixel (0,0) should map to (100, 200)
@@ -2026,6 +2382,29 @@ mod tests {
         let (wx, wy) = transform.pixel_to_world(10.0, 5.0).unwrap();
         assert!((wx - 200.0).abs() < 0.001);
         assert!((wy - 150.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_geo_transform_point_registered() {
+        // Test Point registration (GTRasterTypeGeoKey=PixelIsPoint, tiepoint = pixel center)
+        // When PixelIsPoint, the tiepoint (0,0) -> (100,200) means the CENTER of pixel (0,0) is at (100,200)
+        // GDAL compensates by shifting the geotransform origin by half a pixel
+        let transform = GeoTransform {
+            pixel_scale: Some([10.0, 10.0, 0.0]),
+            tiepoint: Some([0.0, 0.0, 0.0, 100.0, 200.0, 0.0]),
+            is_point_registered: true,
+        };
+
+        // world_to_pixel: World (100, 200) is the center of pixel (0,0)
+        // With the 0.5 offset, this maps to pixel (0.5, 0.5), which truncates to pixel (0, 0)
+        let (px, py) = transform.world_to_pixel(100.0, 200.0).unwrap();
+        assert!((px - 0.5).abs() < 0.001, "Expected px=0.5, got {}", px);
+        assert!((py - 0.5).abs() < 0.001, "Expected py=0.5, got {}", py);
+
+        // A point at (105, 195) should be at pixel (1, 0.5) with truncation to pixel (1, 0)
+        let (px, py) = transform.world_to_pixel(105.0, 195.0).unwrap();
+        assert!((px - 1.0).abs() < 0.001, "Expected px=1.0, got {}", px);
+        assert!((py - 1.0).abs() < 0.001, "Expected py=1.0, got {}", py);
     }
 
     #[test]
@@ -2294,7 +2673,8 @@ mod tests {
     /// handled correctly - all bands within a row are accumulated sequentially.
     ///
     /// Layout for 2-band 8-bit: [pixel0_band0, pixel0_band1, pixel1_band0, pixel1_band1]
-    /// Accumulation proceeds left-to-right across all samples in the row.
+    /// Accumulation proceeds per-component (band) across pixels in the row.
+    /// For pixel-interleaved data: R0 G0 R1 G1 -> R0, G0, R0+R1, G0+G1
     #[test]
     fn test_predictor2_multiband_8bit() {
         // 2 pixels, 2 bands each (8-bit)
@@ -2303,25 +2683,19 @@ mod tests {
 
         let result = apply_predictor(&input, 2, 2, 2, 1).unwrap();
 
-        // Byte-level accumulation: result[i] = input[i] + result[i-1]
-        // result[0] = 10
-        // result[1] = 20 + 10 = 30
-        // result[2] = 1 + 30 = 31
-        // result[3] = 2 + 31 = 33
-        assert_eq!(result[0], 10, "Byte 0");
-        assert_eq!(result[1], 30, "Byte 1 = 20 + 10");
-        assert_eq!(result[2], 31, "Byte 2 = 1 + 30");
-        assert_eq!(result[3], 33, "Byte 3 = 2 + 31");
+        // Per-component accumulation: each band accumulates independently
+        // Band 0: result[0] = 10, result[2] = 10 + 1 = 11
+        // Band 1: result[1] = 20, result[3] = 20 + 2 = 22
+        assert_eq!(result[0], 10, "Pixel 0 Band 0");
+        assert_eq!(result[1], 20, "Pixel 0 Band 1");
+        assert_eq!(result[2], 11, "Pixel 1 Band 0 = 10 + 1");
+        assert_eq!(result[3], 22, "Pixel 1 Band 1 = 20 + 2");
     }
 
-    /// Validates 16-bit multiband predictor=2 (sample-level accumulation).
+    /// Validates 16-bit multiband predictor=2 (per-component accumulation).
     ///
-    /// For 16-bit multiband data, each sample (regardless of which band) must be
-    /// accumulated as a u16, not as individual bytes. This test catches bugs where
-    /// multiband handling might incorrectly interleave byte-level operations.
-    ///
-    /// The key insight: samples_per_row = tile_width * bands, and we accumulate
-    /// across ALL samples in the row, treating each 2-byte pair as a single u16.
+    /// For 16-bit multiband data, each sample must be accumulated as a u16,
+    /// and each band/component accumulates independently (per TIFF Technote 3).
     #[test]
     fn test_predictor2_multiband_16bit() {
         // 2 pixels, 2 bands each (16-bit)
@@ -2336,18 +2710,18 @@ mod tests {
 
         let result = apply_predictor(&input, 2, 2, 2, 2).unwrap();
 
-        // Sample-level accumulation within row
-        // samples_per_row = tile_width * bands = 2 * 2 = 4
-        // s[0] = 100, s[1] = 200 + 100 = 300, s[2] = 1 + 300 = 301, s[3] = 2 + 301 = 303
+        // Per-component accumulation: each band accumulates independently
+        // Band 0: s[0] = 100, s[2] = 100 + 1 = 101
+        // Band 1: s[1] = 200, s[3] = 200 + 2 = 202
         let s0 = u16::from_le_bytes([result[0], result[1]]);
         let s1 = u16::from_le_bytes([result[2], result[3]]);
         let s2 = u16::from_le_bytes([result[4], result[5]]);
         let s3 = u16::from_le_bytes([result[6], result[7]]);
 
-        assert_eq!(s0, 100, "Sample 0");
-        assert_eq!(s1, 300, "Sample 1 = 200 + 100");
-        assert_eq!(s2, 301, "Sample 2 = 1 + 300");
-        assert_eq!(s3, 303, "Sample 3 = 2 + 301");
+        assert_eq!(s0, 100, "Pixel 0 Band 0");
+        assert_eq!(s1, 200, "Pixel 0 Band 1");
+        assert_eq!(s2, 101, "Pixel 1 Band 0 = 100 + 1");
+        assert_eq!(s3, 202, "Pixel 1 Band 1 = 200 + 2");
     }
 
     // ============================================================
@@ -2832,4 +3206,268 @@ fn test_predictor2_multirow() {
     assert_eq!(r2_s0, 200, "Row 2, sample 0 (fresh start)");
     assert_eq!(r2_s1, 205, "Row 2, sample 1: 200 + 5 = 205");
     assert_eq!(r2_s2, 220, "Row 2, sample 2: 205 + 15 = 220");
+}
+
+/// Tests that verify our implementation against GDAL (reference implementation)
+/// These tests require GDAL to be installed and the gdal crate as a dev dependency
+#[cfg(test)]
+mod gdal_verification_tests {
+    use super::*;
+    use crate::point_query::PointQuery;
+    use gdal::Metadata;
+    use std::sync::Arc;
+
+    const TEST_COG_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/copernicus_dem_san_francisco.tif");
+
+    fn get_test_cog() -> Option<CogReader> {
+        if !std::path::Path::new(TEST_COG_PATH).exists() {
+            println!("Skipping: test file not found at {}", TEST_COG_PATH);
+            return None;
+        }
+        let reader = crate::LocalRangeReader::new(TEST_COG_PATH).ok()?;
+        CogReader::from_reader(Arc::new(reader)).ok()
+    }
+
+    /// Verify our geotransform handling matches GDAL exactly
+    /// Tests the half-pixel shift for PixelIsPoint datasets (RFC 33)
+    #[test]
+    fn test_gdal_geotransform_comparison() {
+        let Some(cog) = get_test_cog() else { return };
+
+        // Open with GDAL
+        let gdal_ds = gdal::Dataset::open(TEST_COG_PATH).expect("GDAL failed to open");
+        let gdal_gt = gdal_ds.geo_transform().expect("Failed to get geotransform");
+
+        // Get AREA_OR_POINT metadata
+        let area_or_point = gdal_ds.metadata_item("AREA_OR_POINT", "").unwrap_or_default();
+        println!("GDAL AREA_OR_POINT: {:?}", area_or_point);
+        println!("Our is_point_registered: {}", cog.metadata.geo_transform.is_point_registered);
+
+        // GDAL's geotransform is [origin_x, pixel_width, skew_x, origin_y, skew_y, -pixel_height]
+        let gdal_origin_x = gdal_gt[0];
+        let gdal_origin_y = gdal_gt[3];
+        let gdal_pixel_width = gdal_gt[1];
+        let gdal_pixel_height = -gdal_gt[5]; // GDAL uses negative for Y
+
+        println!("GDAL geotransform: {:?}", gdal_gt);
+        println!("Our tiepoint: {:?}", cog.metadata.geo_transform.tiepoint);
+        println!("Our pixel_scale: {:?}", cog.metadata.geo_transform.pixel_scale);
+
+        // Verify pixel scale matches
+        if let Some(scale) = &cog.metadata.geo_transform.pixel_scale {
+            assert!((scale[0] - gdal_pixel_width).abs() < 1e-12,
+                "Pixel width mismatch: ours={}, gdal={}", scale[0], gdal_pixel_width);
+            assert!((scale[1] - gdal_pixel_height).abs() < 1e-12,
+                "Pixel height mismatch: ours={}, gdal={}", scale[1], gdal_pixel_height);
+        }
+
+        // For PixelIsPoint datasets, GDAL shifts origin by half a pixel
+        // Our implementation stores the raw tiepoint and applies the shift in world_to_pixel
+        if cog.metadata.geo_transform.is_point_registered {
+            println!("\nPixelIsPoint dataset - verifying coordinate transform matches GDAL");
+
+            // Sample several test points and verify pixel coordinates match
+            let test_points = [
+                (-122.4, 37.78),    // SF Downtown
+                (-122.24, 37.88),   // Berkeley Hills
+                (-122.5965, 37.9236), // Mt Tam
+            ];
+
+            for (lon, lat) in test_points {
+                // Our calculation
+                let (our_px, our_py) = cog.metadata.geo_transform.world_to_pixel(lon, lat).unwrap();
+
+                // GDAL calculation: px = (x - origin_x) / pixel_width
+                let gdal_px = (lon - gdal_origin_x) / gdal_pixel_width;
+                let gdal_py = (gdal_origin_y - lat) / gdal_pixel_height;
+
+                println!("Point ({}, {}): ours=({:.6}, {:.6}), gdal=({:.6}, {:.6})",
+                    lon, lat, our_px, our_py, gdal_px, gdal_py);
+
+                assert!((our_px - gdal_px).abs() < 0.001,
+                    "X pixel mismatch at ({}, {}): ours={}, gdal={}", lon, lat, our_px, gdal_px);
+                assert!((our_py - gdal_py).abs() < 0.001,
+                    "Y pixel mismatch at ({}, {}): ours={}, gdal={}", lon, lat, our_py, gdal_py);
+            }
+        }
+    }
+
+    /// Verify pixel values match GDAL exactly at specific coordinates
+    #[test]
+    fn test_gdal_pixel_value_comparison() {
+        let Some(cog) = get_test_cog() else { return };
+
+        // Open with GDAL
+        let gdal_ds = gdal::Dataset::open(TEST_COG_PATH).expect("GDAL failed to open");
+        let band = gdal_ds.rasterband(1).expect("Failed to get band 1");
+
+        // Test coordinates with known elevations
+        let test_coords = [
+            (-122.4, 37.78, "SF Downtown"),
+            (-122.24, 37.88, "Berkeley Hills"),
+            (-122.5965, 37.9236, "Mt Tam"),
+            (-122.38, 37.79, "SF Bay"),
+        ];
+
+        let gdal_gt = gdal_ds.geo_transform().expect("Failed to get geotransform");
+
+        for (lon, lat, name) in test_coords {
+            // Calculate pixel coordinates using GDAL's geotransform
+            let gdal_px = ((lon - gdal_gt[0]) / gdal_gt[1]) as isize;
+            let gdal_py = ((gdal_gt[3] - lat) / (-gdal_gt[5])) as isize;
+
+            // Read GDAL value
+            let gdal_buf: gdal::raster::Buffer<f32> = band.read_as((gdal_px, gdal_py), (1, 1), (1, 1), None)
+                .expect("GDAL read failed");
+            let gdal_value = gdal_buf.data()[0];
+
+            // Read our value via point query
+            let our_result = cog.sample_lonlat(lon, lat).expect("Our read failed");
+            let our_value = our_result.get(0).unwrap_or(f32::NAN);
+
+            println!("{}: GDAL pixel=({}, {}) value={}, Our pixel={:?} value={}",
+                name, gdal_px, gdal_py, gdal_value, our_result.pixel_coords, our_value);
+
+            assert!((our_value - gdal_value).abs() < 0.001,
+                "{}: Value mismatch - ours={}, gdal={}", name, our_value, gdal_value);
+        }
+    }
+
+    /// Verify tile reading matches GDAL at tile boundaries
+    #[test]
+    fn test_gdal_tile_value_comparison() {
+        let Some(cog) = get_test_cog() else { return };
+
+        // Open with GDAL
+        let gdal_ds = gdal::Dataset::open(TEST_COG_PATH).expect("GDAL failed to open");
+        let band = gdal_ds.rasterband(1).expect("Failed to get band 1");
+
+        // Read specific pixels and compare
+        let test_pixels = [
+            (0, 0),       // First pixel
+            (1023, 0),    // End of first tile row
+            (1024, 0),    // Start of second tile column
+            (0, 1024),    // Start of second tile row
+            (2736, 432),  // Berkeley Hills pixel
+        ];
+
+        for (px, py) in test_pixels {
+            // Read GDAL value
+            let gdal_buf: gdal::raster::Buffer<f32> = band.read_as((px as isize, py as isize), (1, 1), (1, 1), None)
+                .expect("GDAL read failed");
+            let gdal_value = gdal_buf.data()[0];
+
+            // Read our value
+            let our_value = cog.sample(0, px, py).expect("Our read failed").unwrap_or(f32::NAN);
+
+            println!("Pixel ({}, {}): GDAL={}, Ours={}", px, py, gdal_value, our_value);
+
+            assert!((our_value - gdal_value).abs() < 0.001,
+                "Pixel ({}, {}): mismatch - ours={}, gdal={}", px, py, our_value, gdal_value);
+        }
+    }
+
+    // ========== RGB COG Tests ==========
+
+    const RGB_COG_PATH: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/data/natural_earth_rgb.tif");
+
+    fn get_rgb_cog() -> Option<CogReader> {
+        if !std::path::Path::new(RGB_COG_PATH).exists() {
+            println!("Skipping: RGB test file not found at {}", RGB_COG_PATH);
+            return None;
+        }
+        let reader = crate::LocalRangeReader::new(RGB_COG_PATH).ok()?;
+        CogReader::from_reader(Arc::new(reader)).ok()
+    }
+
+    #[test]
+    fn test_rgb_cog_metadata() {
+        let Some(cog) = get_rgb_cog() else { return };
+
+        // Verify RGB COG has expected properties
+        assert_eq!(cog.metadata.bands, 3, "Should have 3 bands (RGB)");
+        assert_eq!(cog.metadata.crs_code, Some(4326));
+        assert_eq!(cog.metadata.data_type, crate::CogDataType::UInt8);
+
+        // Should have overviews (on CogReader, not CogMetadata)
+        assert!(!cog.overviews.is_empty(), "Should have overviews");
+        println!("RGB COG: {}x{}, {} bands, {} overviews",
+            cog.metadata.width, cog.metadata.height,
+            cog.metadata.bands, cog.overviews.len());
+    }
+
+    #[test]
+    fn test_rgb_cog_gdal_metadata_comparison() {
+        let Some(cog) = get_rgb_cog() else { return };
+
+        let gdal_ds = gdal::Dataset::open(RGB_COG_PATH).expect("GDAL failed to open RGB COG");
+
+        // Compare dimensions
+        let (gdal_width, gdal_height) = gdal_ds.raster_size();
+        assert_eq!(cog.metadata.width, gdal_width);
+        assert_eq!(cog.metadata.height, gdal_height);
+
+        // Compare band count
+        assert_eq!(cog.metadata.bands, gdal_ds.raster_count());
+
+        // Compare geotransform
+        let gdal_gt = gdal_ds.geo_transform().expect("Failed to get geotransform");
+        if let Some(scale) = &cog.metadata.geo_transform.pixel_scale {
+            assert!((scale[0] - gdal_gt[1]).abs() < 1e-10,
+                "X pixel scale mismatch: ours={}, gdal={}", scale[0], gdal_gt[1]);
+        }
+    }
+
+    #[test]
+    fn test_rgb_cog_multiband_pixel_values() {
+        let Some(cog) = get_rgb_cog() else { return };
+
+        let gdal_ds = gdal::Dataset::open(RGB_COG_PATH).expect("GDAL failed to open RGB COG");
+        let (width, height) = gdal_ds.raster_size();
+
+        // Test pixels at corners and center
+        let test_pixels = [
+            (0, 0),                           // Top-left corner
+            (width / 2, height / 2),          // Center
+            (width - 1, height - 1),          // Bottom-right corner
+            (width / 4, height / 4),          // Quarter point
+        ];
+
+        for (px, py) in test_pixels {
+            // Read all bands from GDAL
+            for band_idx in 1..=cog.metadata.bands {
+                let band = gdal_ds.rasterband(band_idx).expect("Failed to get band");
+                let gdal_buf: gdal::raster::Buffer<u8> = band.read_as((px as isize, py as isize), (1, 1), (1, 1), None)
+                    .expect("GDAL read failed");
+                let gdal_value = gdal_buf.data()[0] as f32;
+
+                // Read our value (band indices are 0-based)
+                let our_value = cog.sample(band_idx - 1, px, py).expect("Our read failed").unwrap_or(f32::NAN);
+
+                assert!((our_value - gdal_value).abs() < 0.01,
+                    "Pixel ({}, {}) band {}: mismatch - ours={}, gdal={}",
+                    px, py, band_idx, our_value, gdal_value);
+            }
+        }
+    }
+
+    #[test]
+    fn test_rgb_cog_overview_dimensions() {
+        let Some(cog) = get_rgb_cog() else { return };
+
+        // Verify overviews exist and dimensions decrease
+        assert!(!cog.overviews.is_empty(), "Should have overviews");
+
+        let mut prev_width = cog.metadata.width;
+        let mut prev_height = cog.metadata.height;
+
+        for (i, overview) in cog.overviews.iter().enumerate() {
+            assert!(overview.width < prev_width,
+                "Overview {} width should be smaller than previous", i);
+            assert!(overview.height < prev_height,
+                "Overview {} height should be smaller than previous", i);
+            prev_width = overview.width;
+            prev_height = overview.height;
+        }
+    }
 }

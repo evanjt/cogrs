@@ -5,17 +5,21 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```rust,no_run
+//! // Import CogSource trait to use the entries() method
 //! use cogrs::source::{CogSource, LocalCogSource, LocalScanOptions, CogEntry};
 //!
-//! // Discover COGs in a directory with default options (recursive)
-//! let source = LocalCogSource::scan("/path/to/data", LocalScanOptions::default())?;
+//! fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+//!     // Discover COGs in a directory with default options (recursive)
+//!     let source = LocalCogSource::scan("/path/to/data", &LocalScanOptions::default())?;
 //!
-//! // Or scan layer-style directories (depth=2)
-//! let source = LocalCogSource::scan("/path/to/layers", LocalScanOptions::layers())?;
+//!     // Or scan layer-style directories (depth=2)
+//!     let source = LocalCogSource::scan("/path/to/layers", &LocalScanOptions::layers())?;
 //!
-//! for entry in source.entries() {
-//!     println!("Found COG: {} at {:?}", entry.name, entry.location);
+//!     for entry in source.entries() {
+//!         println!("Found COG: {} at {:?}", entry.name, entry.location);
+//!     }
+//!     Ok(())
 //! }
 //! ```
 
@@ -36,7 +40,7 @@ use crate::xyz_tile::BoundingBox;
 pub enum CogLocation {
     /// Local filesystem path
     Local(PathBuf),
-    /// S3 URL (s3://bucket/key)
+    /// S3 URL (<s3://bucket/key>)
     S3 { bucket: String, key: String },
     /// HTTP(S) URL
     Http(String),
@@ -44,10 +48,11 @@ pub enum CogLocation {
 
 impl CogLocation {
     /// Get a display string for the location
+    #[must_use] 
     pub fn display(&self) -> String {
         match self {
             CogLocation::Local(path) => path.display().to_string(),
-            CogLocation::S3 { bucket, key } => format!("s3://{}/{}", bucket, key),
+            CogLocation::S3 { bucket, key } => format!("s3://{bucket}/{key}"),
             CogLocation::Http(url) => url.clone(),
         }
     }
@@ -85,14 +90,17 @@ pub struct CogEntry {
     pub has_overviews: bool,
     /// Number of overview levels
     pub overview_count: usize,
-    /// NoData value (if defined)
+    /// `NoData` value (if defined)
     pub nodata: Option<f64>,
 }
 
 impl CogEntry {
-    /// Create a CogEntry from a CogReader's metadata.
+    /// Create a `CogEntry` from a `CogReader`'s metadata.
     ///
     /// Extracts all relevant metadata from the reader without loading raster data.
+    ///
+    /// # Errors
+    /// Returns an error if coordinate projection to WGS84 fails.
     pub fn from_reader(
         reader: &CogReader,
         name: String,
@@ -143,26 +151,32 @@ impl CogEntry {
             let pixel_width = scale[0];
             let pixel_height = scale[1];
 
-            let minx = origin_x;
-            let maxy = origin_y;
-            let maxx = origin_x + pixel_width * metadata.width as f64;
-            let miny = origin_y - pixel_height * metadata.height as f64;
+            let bounds_min_x = origin_x;
+            let bounds_max_y = origin_y;
+            // Allow cast precision loss: geographic bounds only need approximate precision
+            #[allow(clippy::cast_precision_loss)]
+            let bounds_max_x = origin_x + pixel_width * metadata.width as f64;
+            #[allow(clippy::cast_precision_loss)]
+            let bounds_min_y = origin_y - pixel_height * metadata.height as f64;
 
-            BoundingBox::new(minx, miny, maxx, maxy)
+            BoundingBox::new(bounds_min_x, bounds_min_y, bounds_max_x, bounds_max_y)
         } else {
             // No geotransform - use pixel coordinates
+            // Allow cast precision loss: pixel coordinates only need approximate precision
+            #[allow(clippy::cast_precision_loss)]
             BoundingBox::new(0.0, 0.0, metadata.width as f64, metadata.height as f64)
         }
     }
 
     /// Project bounds to WGS84 (EPSG:4326).
     fn project_bounds_to_wgs84(bounds: &BoundingBox, source_crs: i32) -> Result<BoundingBox, String> {
-        let (minx, miny) = project_point(source_crs, 4326, bounds.minx, bounds.miny)?;
-        let (maxx, maxy) = project_point(source_crs, 4326, bounds.maxx, bounds.maxy)?;
-        Ok(BoundingBox::new(minx, miny, maxx, maxy))
+        let (proj_min_x, proj_min_y) = project_point(source_crs, 4326, bounds.minx, bounds.miny)?;
+        let (proj_max_x, proj_max_y) = project_point(source_crs, 4326, bounds.maxx, bounds.maxy)?;
+        Ok(BoundingBox::new(proj_min_x, proj_min_y, proj_max_x, proj_max_y))
     }
 
     /// Check if this COG intersects with a given bounding box (in WGS84).
+    #[must_use] 
     pub fn intersects_wgs84(&self, bbox: &BoundingBox) -> bool {
         !(self.bounds_wgs84.maxx < bbox.minx
             || self.bounds_wgs84.minx > bbox.maxx

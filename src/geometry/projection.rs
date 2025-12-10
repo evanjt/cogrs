@@ -10,7 +10,10 @@
 /// * `y` - Y coordinate in source CRS
 ///
 /// # Returns
-/// Tuple of (x, y) in target CRS, or an error if the EPSG code is not supported.
+/// Tuple of (x, y) in target CRS
+///
+/// # Errors
+/// Returns an error if the EPSG code is not supported or the projection transformation fails.
 #[inline]
 pub fn project_point(source_epsg: i32, target_epsg: i32, x: f64, y: f64) -> Result<(f64, f64), String> {
     // No-op if same CRS
@@ -22,15 +25,41 @@ pub fn project_point(source_epsg: i32, target_epsg: i32, x: f64, y: f64) -> Resu
 }
 
 /// Convenience function: longitude/latitude (EPSG:4326) to Web Mercator (EPSG:3857)
+///
+/// **Warning**: Returns original coordinates on projection failure.
+/// Use [`try_lon_lat_to_mercator`] if you need to detect errors.
 #[inline]
+#[must_use]
 pub fn lon_lat_to_mercator(lon: f64, lat: f64) -> (f64, f64) {
     project_point(4326, 3857, lon, lat).unwrap_or((lon, lat))
 }
 
 /// Convenience function: Web Mercator (EPSG:3857) to longitude/latitude (EPSG:4326)
+///
+/// **Warning**: Returns original coordinates on projection failure.
+/// Use [`try_mercator_to_lon_lat`] if you need to detect errors.
 #[inline]
+#[must_use]
 pub fn mercator_to_lon_lat(x: f64, y: f64) -> (f64, f64) {
     project_point(3857, 4326, x, y).unwrap_or((x, y))
+}
+
+/// Fallible version of [`lon_lat_to_mercator`]
+///
+/// # Errors
+/// Returns an error if the projection transformation fails.
+#[inline]
+pub fn try_lon_lat_to_mercator(lon: f64, lat: f64) -> Result<(f64, f64), String> {
+    project_point(4326, 3857, lon, lat)
+}
+
+/// Fallible version of [`mercator_to_lon_lat`]
+///
+/// # Errors
+/// Returns an error if the projection transformation fails.
+#[inline]
+pub fn try_mercator_to_lon_lat(x: f64, y: f64) -> Result<(f64, f64), String> {
+    project_point(3857, 4326, x, y)
 }
 
 /// Get PROJ4 string for an EPSG code using the crs-definitions database
@@ -43,6 +72,7 @@ pub fn get_proj_string(epsg: i32) -> Option<&'static str> {
 
 /// Check if an EPSG code represents a geographic (lon/lat) CRS
 #[inline]
+#[must_use] 
 pub fn is_geographic_crs(epsg: i32) -> bool {
     // Geographic CRS codes are typically in the 4000-4999 range
     // but we check the proj string to be sure
@@ -60,14 +90,14 @@ fn project_with_proj4rs(source_epsg: i32, target_epsg: i32, x: f64, y: f64) -> R
     use proj4rs::transform::transform;
 
     let source_str = get_proj_string(source_epsg)
-        .ok_or_else(|| format!("EPSG:{} is not in the crs-definitions database", source_epsg))?;
+        .ok_or_else(|| format!("EPSG:{source_epsg} is not in the crs-definitions database"))?;
     let target_str = get_proj_string(target_epsg)
-        .ok_or_else(|| format!("EPSG:{} is not in the crs-definitions database", target_epsg))?;
+        .ok_or_else(|| format!("EPSG:{target_epsg} is not in the crs-definitions database"))?;
 
     let source_proj = Proj::from_proj_string(source_str)
-        .map_err(|e| format!("Invalid source projection EPSG:{}: {:?}", source_epsg, e))?;
+        .map_err(|e| format!("Invalid source projection EPSG:{source_epsg}: {e:?}"))?;
     let target_proj = Proj::from_proj_string(target_str)
-        .map_err(|e| format!("Invalid target projection EPSG:{}: {:?}", target_epsg, e))?;
+        .map_err(|e| format!("Invalid target projection EPSG:{target_epsg}: {e:?}"))?;
 
     // proj4rs uses radians for geographic coordinates
     let source_is_geographic = is_geographic_crs(source_epsg);
@@ -79,7 +109,7 @@ fn project_with_proj4rs(source_epsg: i32, target_epsg: i32, x: f64, y: f64) -> R
 
     let mut point = (x_in, y_in, 0.0);
     transform(&source_proj, &target_proj, &mut point)
-        .map_err(|e| format!("Transform from EPSG:{} to EPSG:{} failed: {:?}", source_epsg, target_epsg, e))?;
+        .map_err(|e| format!("Transform from EPSG:{source_epsg} to EPSG:{target_epsg} failed: {e:?}"))?;
 
     // Convert back from radians if target is geographic
     let target_is_geographic = is_geographic_crs(target_epsg);
@@ -221,5 +251,220 @@ mod tests {
         let result = project_point(4326, 999999, 0.0, 0.0);
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("not in the crs-definitions database"));
+    }
+
+    #[test]
+    fn test_common_geographic_crs() {
+        // Test common geographic CRS codes
+        let geographic_codes = [
+            4326,  // WGS84
+            4269,  // NAD83
+            4267,  // NAD27
+            4258,  // ETRS89
+            4674,  // SIRGAS 2000
+            4326,  // WGS84
+        ];
+
+        for code in geographic_codes {
+            let result = get_proj_string(code);
+            assert!(result.is_some(), "EPSG:{} should be supported", code);
+        }
+    }
+
+    #[test]
+    fn test_utm_zone_coverage() {
+        // Test all UTM zones (1-60 North and South)
+        let mut supported = 0;
+        let mut unsupported = Vec::new();
+
+        // UTM zones North (32601-32660)
+        for zone in 1..=60 {
+            let code = 32600 + zone;
+            if get_proj_string(code).is_some() {
+                supported += 1;
+            } else {
+                unsupported.push(code);
+            }
+        }
+
+        // UTM zones South (32701-32760)
+        for zone in 1..=60 {
+            let code = 32700 + zone;
+            if get_proj_string(code).is_some() {
+                supported += 1;
+            } else {
+                unsupported.push(code);
+            }
+        }
+
+        // All 120 UTM zones should be supported
+        assert!(unsupported.is_empty(),
+            "Unsupported UTM zones: {:?}. Supported: {}/120", unsupported, supported);
+    }
+
+    #[test]
+    fn test_national_grid_systems() {
+        // Test common national/regional grid systems
+        let national_grids = [
+            (27700, "British National Grid"),
+            (2154, "RGF93 / Lambert-93 (France)"),
+            (25832, "ETRS89 / UTM zone 32N"),
+            (3035, "ETRS89-extended / LAEA Europe"),
+            (32632, "WGS 84 / UTM zone 32N"),
+        ];
+
+        for (code, name) in national_grids {
+            let result = get_proj_string(code);
+            assert!(result.is_some(), "EPSG:{} ({}) should be supported", code, name);
+
+            // Also test transformation roundtrip
+            let result = project_point(4326, code, 10.0, 52.0);
+            assert!(result.is_ok(), "Transform to EPSG:{} should work: {:?}", code, result);
+        }
+    }
+}
+
+/// GDAL verification tests for coordinate transforms
+#[cfg(test)]
+mod gdal_verification_tests {
+    use super::*;
+    use gdal::spatial_ref::{CoordTransform, SpatialRef};
+
+    /// Verify WGS84 to Web Mercator transforms match GDAL
+    #[test]
+    fn test_gdal_transform_4326_to_3857() {
+        let mut gdal_src = SpatialRef::from_epsg(4326).expect("GDAL failed to create SRS 4326");
+        let mut gdal_dst = SpatialRef::from_epsg(3857).expect("GDAL failed to create SRS 3857");
+        gdal_src.set_axis_mapping_strategy(gdal::spatial_ref::AxisMappingStrategy::TraditionalGisOrder);
+        gdal_dst.set_axis_mapping_strategy(gdal::spatial_ref::AxisMappingStrategy::TraditionalGisOrder);
+        let gdal_transform = CoordTransform::new(&gdal_src, &gdal_dst).expect("GDAL transform failed");
+
+        let test_points = [
+            (0.0, 0.0),
+            (-122.4, 37.8),   // SF
+            (139.7, 35.7),    // Tokyo
+            (-73.9, 40.7),    // NYC
+            (2.35, 48.85),    // Paris
+        ];
+
+        for (lon, lat) in test_points {
+            // Our transform
+            let (our_x, our_y) = project_point(4326, 3857, lon, lat)
+                .expect("Our transform failed");
+
+            // GDAL transform
+            let mut gdal_x = [lon];
+            let mut gdal_y = [lat];
+            gdal_transform.transform_coords(&mut gdal_x, &mut gdal_y, &mut [])
+                .expect("GDAL transform failed");
+
+            let tolerance = 0.01; // 1cm tolerance
+            assert!((our_x - gdal_x[0]).abs() < tolerance,
+                "X mismatch at ({}, {}): ours={}, gdal={}", lon, lat, our_x, gdal_x[0]);
+            assert!((our_y - gdal_y[0]).abs() < tolerance,
+                "Y mismatch at ({}, {}): ours={}, gdal={}", lon, lat, our_y, gdal_y[0]);
+        }
+        println!("4326 -> 3857 transforms verified against GDAL");
+    }
+
+    /// Verify Web Mercator to WGS84 transforms match GDAL
+    #[test]
+    fn test_gdal_transform_3857_to_4326() {
+        let mut gdal_src = SpatialRef::from_epsg(3857).expect("GDAL failed to create SRS 3857");
+        let mut gdal_dst = SpatialRef::from_epsg(4326).expect("GDAL failed to create SRS 4326");
+        gdal_src.set_axis_mapping_strategy(gdal::spatial_ref::AxisMappingStrategy::TraditionalGisOrder);
+        gdal_dst.set_axis_mapping_strategy(gdal::spatial_ref::AxisMappingStrategy::TraditionalGisOrder);
+        let gdal_transform = CoordTransform::new(&gdal_src, &gdal_dst).expect("GDAL transform failed");
+
+        let test_points = [
+            (0.0, 0.0),
+            (-13627665.0, 4551343.0),  // SF in Web Mercator
+            (15554718.0, 4255815.0),   // Tokyo
+            (-8226439.0, 4974863.0),   // NYC
+        ];
+
+        for (x, y) in test_points {
+            // Our transform
+            let (our_lon, our_lat) = project_point(3857, 4326, x, y)
+                .expect("Our transform failed");
+
+            // GDAL transform
+            let mut gdal_x = [x];
+            let mut gdal_y = [y];
+            gdal_transform.transform_coords(&mut gdal_x, &mut gdal_y, &mut [])
+                .expect("GDAL transform failed");
+
+            let tolerance = 1e-6; // ~0.1m in degrees
+            assert!((our_lon - gdal_x[0]).abs() < tolerance,
+                "Lon mismatch at ({}, {}): ours={}, gdal={}", x, y, our_lon, gdal_x[0]);
+            assert!((our_lat - gdal_y[0]).abs() < tolerance,
+                "Lat mismatch at ({}, {}): ours={}, gdal={}", x, y, our_lat, gdal_y[0]);
+        }
+        println!("3857 -> 4326 transforms verified against GDAL");
+    }
+
+    /// Verify UTM transforms match GDAL
+    #[test]
+    fn test_gdal_transform_to_utm() {
+        // Test WGS84 to UTM Zone 10N (covers SF area)
+        let mut gdal_src = SpatialRef::from_epsg(4326).expect("GDAL failed to create SRS 4326");
+        let mut gdal_dst = SpatialRef::from_epsg(32610).expect("GDAL failed to create SRS 32610");
+        gdal_src.set_axis_mapping_strategy(gdal::spatial_ref::AxisMappingStrategy::TraditionalGisOrder);
+        gdal_dst.set_axis_mapping_strategy(gdal::spatial_ref::AxisMappingStrategy::TraditionalGisOrder);
+        let gdal_transform = CoordTransform::new(&gdal_src, &gdal_dst).expect("GDAL transform failed");
+
+        let test_points = [
+            (-122.4, 37.78),    // SF Downtown
+            (-122.24, 37.88),   // Berkeley Hills
+            (-122.5965, 37.9236), // Mt Tam
+        ];
+
+        for (lon, lat) in test_points {
+            // Our transform
+            let (our_x, our_y) = project_point(4326, 32610, lon, lat)
+                .expect("Our transform failed");
+
+            // GDAL transform
+            let mut gdal_x = [lon];
+            let mut gdal_y = [lat];
+            gdal_transform.transform_coords(&mut gdal_x, &mut gdal_y, &mut [])
+                .expect("GDAL transform failed");
+
+            let tolerance = 0.01; // 1cm tolerance
+            assert!((our_x - gdal_x[0]).abs() < tolerance,
+                "X mismatch at ({}, {}): ours={}, gdal={}", lon, lat, our_x, gdal_x[0]);
+            assert!((our_y - gdal_y[0]).abs() < tolerance,
+                "Y mismatch at ({}, {}): ours={}, gdal={}", lon, lat, our_y, gdal_y[0]);
+        }
+        println!("4326 -> 32610 (UTM 10N) transforms verified against GDAL");
+    }
+
+    /// Verify transform roundtrips match GDAL
+    #[test]
+    fn test_gdal_transform_roundtrip() {
+        let test_cases = [
+            (4326, 3857, -122.4, 37.78),
+            (4326, 32610, -122.4, 37.78),
+            (3857, 4326, -13627665.0, 4551343.0),
+        ];
+
+        for (src_epsg, dst_epsg, x, y) in test_cases {
+            // Forward transform
+            let (mid_x, mid_y) = project_point(src_epsg, dst_epsg, x, y)
+                .expect("Forward transform failed");
+
+            // Reverse transform
+            let (final_x, final_y) = project_point(dst_epsg, src_epsg, mid_x, mid_y)
+                .expect("Reverse transform failed");
+
+            let tolerance = if is_geographic_crs(src_epsg) { 1e-8 } else { 0.001 };
+            assert!((final_x - x).abs() < tolerance,
+                "X roundtrip failed for {} -> {} -> {}: {} -> {} -> {}",
+                src_epsg, dst_epsg, src_epsg, x, mid_x, final_x);
+            assert!((final_y - y).abs() < tolerance,
+                "Y roundtrip failed for {} -> {} -> {}: {} -> {} -> {}",
+                src_epsg, dst_epsg, src_epsg, y, mid_y, final_y);
+        }
+        println!("Transform roundtrips verified");
     }
 }

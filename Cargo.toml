@@ -60,6 +60,8 @@ tempfile = "3.19.1"
 tokio = { version = "1.44.2", features = ["full", "test-util"] }
 rand = "0.9"
 criterion = { version = "0.6", features = ["html_reports"] }
+tiff = "0.10.3"
+gdal = { git = "https://github.com/georust/gdal", features = ["bindgen"] }  # Using git for GDAL 3.12 support
 
 [[bench]]
 name = "tile_extraction"

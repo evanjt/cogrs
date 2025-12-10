@@ -1,6 +1,6 @@
 //! S3 COG source.
 //!
-//! Scans S3 buckets for GeoTIFF files and extracts metadata.
+//! Scans S3 buckets for `GeoTIFF` files and extracts metadata.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -21,11 +21,11 @@ use super::{CogEntry, CogLocation, CogSource};
 pub struct S3ScanOptions {
     /// Prefix to filter objects (e.g., "data/layers/")
     pub prefix: Option<String>,
-    /// File extensions to consider as GeoTIFFs (case-insensitive)
+    /// File extensions to consider as `GeoTIFFs` (case-insensitive)
     pub extensions: Vec<String>,
     /// Maximum number of objects to scan
     pub max_objects: Option<usize>,
-    /// Custom endpoint URL (for MinIO, LocalStack, etc.)
+    /// Custom endpoint URL (for `MinIO`, `LocalStack`, etc.)
     pub endpoint_url: Option<String>,
     /// AWS region
     pub region: Option<String>,
@@ -55,6 +55,7 @@ impl Default for S3ScanOptions {
 
 impl S3ScanOptions {
     /// Create options with a specific prefix
+    #[must_use] 
     pub fn with_prefix(prefix: &str) -> Self {
         Self {
             prefix: Some(prefix.to_string()),
@@ -62,25 +63,29 @@ impl S3ScanOptions {
         }
     }
 
-    /// Set the endpoint URL (for MinIO, etc.)
+    /// Set the endpoint URL (for `MinIO`, etc.)
+    #[must_use] 
     pub fn with_endpoint(mut self, endpoint: &str) -> Self {
         self.endpoint_url = Some(endpoint.to_string());
         self
     }
 
     /// Set the region
+    #[must_use] 
     pub fn with_region(mut self, region: &str) -> Self {
         self.region = Some(region.to_string());
         self
     }
 
     /// Allow HTTP connections
+    #[must_use] 
     pub fn with_allow_http(mut self, allow: bool) -> Self {
         self.allow_http = allow;
         self
     }
 
     /// Set maximum number of objects to scan
+    #[must_use] 
     pub fn with_max_objects(mut self, max: usize) -> Self {
         self.max_objects = Some(max);
         self
@@ -89,21 +94,25 @@ impl S3ScanOptions {
 
 /// COG source that scans S3 buckets.
 ///
-/// Discovers GeoTIFF files in an S3 bucket and extracts metadata from each.
+/// Discovers `GeoTIFF` files in an S3 bucket and extracts metadata from each.
 ///
 /// # Example
 ///
-/// ```rust,ignore
-/// use cogrs::source::{S3CogSource, S3ScanOptions};
+/// ```rust,no_run
+/// use cogrs::source::{CogSource, S3CogSource, S3ScanOptions};
 ///
-/// // Scan with default options
-/// let source = S3CogSource::scan("my-bucket", S3ScanOptions::default()).await?;
+/// #[tokio::main]
+/// async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+///     // Scan with default options
+///     let source = S3CogSource::scan("my-bucket", S3ScanOptions::default()).await?;
 ///
-/// // Or scan with a prefix
-/// let source = S3CogSource::scan("my-bucket", S3ScanOptions::with_prefix("data/cogs/")).await?;
+///     // Or scan with a prefix
+///     let source = S3CogSource::scan("my-bucket", S3ScanOptions::with_prefix("data/cogs/")).await?;
 ///
-/// for entry in source.entries() {
-///     println!("Found: {} ({} bands)", entry.name, entry.bands);
+///     for entry in source.entries() {
+///         println!("Found: {} ({} bands)", entry.name, entry.bands);
+///     }
+///     Ok(())
 /// }
 /// ```
 pub struct S3CogSource {
@@ -121,6 +130,9 @@ impl S3CogSource {
     ///
     /// # Returns
     /// A `S3CogSource` containing metadata for all discovered COGs.
+    ///
+    /// # Errors
+    /// Returns an error if the S3 bucket cannot be accessed or listed.
     pub async fn scan(
         bucket: &str,
         options: S3ScanOptions,
@@ -177,16 +189,15 @@ impl S3CogSource {
             let is_geotiff = key
                 .rsplit('.')
                 .next()
-                .map(|ext| options.extensions.iter().any(|x| x.eq_ignore_ascii_case(ext)))
-                .unwrap_or(false);
+                .is_some_and(|ext| options.extensions.iter().any(|x| x.eq_ignore_ascii_case(ext)));
 
             if !is_geotiff {
                 continue;
             }
 
             // Try to read COG metadata
-            let s3_url = format!("s3://{}/{}", bucket, key);
-            match Self::read_cog_entry(&s3_url, &meta).await {
+            let s3_url = format!("s3://{bucket}/{key}");
+            match Self::read_cog_entry(&s3_url, &meta) {
                 Ok(cog_entry) => {
                     let idx = entries.len();
                     entries_by_name.insert(cog_entry.name.clone(), idx);
@@ -208,7 +219,7 @@ impl S3CogSource {
     }
 
     /// Read metadata from a single S3 COG file.
-    async fn read_cog_entry(
+    fn read_cog_entry(
         s3_url: &str,
         meta: &object_store::ObjectMeta,
     ) -> Result<CogEntry, Box<dyn std::error::Error + Send + Sync>> {
@@ -240,15 +251,17 @@ impl S3CogSource {
             size_bytes,
             last_modified,
         )
-        .map_err(|e| e.into())
+        .map_err(std::convert::Into::into)
     }
 
     /// Get the bucket name
+    #[must_use] 
     pub fn bucket(&self) -> &str {
         &self.bucket
     }
 
     /// Get statistics about discovered COGs.
+    #[must_use] 
     pub fn stats(&self) -> S3SourceStats {
         let total_size: u64 = self.entries.iter().filter_map(|e| e.size_bytes).sum();
         let tiled_count = self.entries.iter().filter(|e| e.is_tiled).count();
@@ -288,8 +301,11 @@ pub struct S3SourceStats {
 
 impl S3SourceStats {
     /// Get total size in megabytes
+    #[must_use]
     pub fn total_size_mb(&self) -> f64 {
-        self.total_size_bytes as f64 / 1024.0 / 1024.0
+        // Allow cast precision loss: file sizes in MB don't need exact precision
+        #[allow(clippy::cast_precision_loss)]
+        { self.total_size_bytes as f64 / 1024.0 / 1024.0 }
     }
 }
 

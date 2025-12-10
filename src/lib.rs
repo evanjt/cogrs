@@ -1,29 +1,4 @@
-//! # cogrs - Pure Rust COG (Cloud Optimized GeoTIFF) Reader
-//!
-//! A library for reading Cloud Optimized GeoTIFFs without GDAL.
-//!
-//! ## Features
-//!
-//! - Pure Rust, no GDAL dependency
-//! - Range requests for local files, HTTP, and S3
-//! - Compression: DEFLATE, LZW, ZSTD, JPEG, WebP
-//! - Coordinate transforms via proj4rs
-//! - Point queries at geographic coordinates
-//! - XYZ tile extraction with resampling options
-//!
-//! ## Quick Start
-//!
-//! ```rust,ignore
-//! use cogrs::{CogReader, PointQuery, extract_xyz_tile};
-//!
-//! let reader = CogReader::open("path/to/file.tif")?;
-//!
-//! // Point query
-//! let result = reader.sample_lonlat(-122.4, 37.8)?;
-//!
-//! // XYZ tile
-//! let tile = extract_xyz_tile(&reader, 10, 163, 395, (256, 256))?;
-//! ```
+#![doc = include_str!("../README.md")]
 //!
 //! ## Architecture
 //!
@@ -38,13 +13,16 @@
 //! - [`tile_cache`]: Global LRU cache for decompressed tiles
 //! - [`s3`]: S3-compatible storage backend
 //! - [`raster`]: Raster data abstraction trait
+//! - [`geotiff_writer`]: Write reprojected rasters to GeoTIFF files
 
 // ============================================================================
 // Public modules
 // ============================================================================
 
+pub mod casting;
 pub mod cog_reader;
 pub mod geometry;
+pub mod geotiff_writer;
 pub mod lzw_fallback;
 pub mod point_query;
 pub mod range_reader;
@@ -82,8 +60,9 @@ pub use point_query::{
 };
 
 // ============================================================================
-// XYZ Tile Extraction (async)
+// XYZ Tile Extraction
 // ============================================================================
+// Primary API: TileExtractor::new(&reader).xyz(...).extract().await
 
 pub use xyz_tile::{
     TileData,
@@ -91,11 +70,19 @@ pub use xyz_tile::{
     BoundingBox,
     CoordTransformer,
     ResamplingMethod,
-    extract_xyz_tile,
-    extract_tile_with_extent,
-    extract_tile_with_extent_resampled,
-    extract_tile_with_bands,
-    extract_xyz_tiles_concurrent,
+};
+
+// ============================================================================
+// Raster Reprojection
+// ============================================================================
+// Primary API: Reprojector::new(&reader).to_crs(...).extract().await
+
+pub use xyz_tile::{
+    Reprojector,
+    ReprojectedRaster,
+    StreamingReprojector,
+    StreamingOutputInfo,
+    RasterChunk,
 };
 
 // ============================================================================
@@ -107,6 +94,8 @@ pub use geometry::projection::{
     project_point,
     lon_lat_to_mercator,
     mercator_to_lon_lat,
+    try_lon_lat_to_mercator,
+    try_mercator_to_lon_lat,
     get_proj_string,
     is_geographic_crs,
 };
@@ -160,3 +149,13 @@ pub use tile_cache::TileCache;
 // ============================================================================
 
 pub use raster::RasterSource;
+
+// ============================================================================
+// GeoTIFF Writing
+// ============================================================================
+
+pub use geotiff_writer::{
+    GeoTiffCompression,
+    GeoTiffWriteError,
+    GeoTiffWriter,
+};

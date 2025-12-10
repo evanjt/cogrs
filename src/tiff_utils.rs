@@ -39,6 +39,8 @@ pub struct IfdEntry {
     pub raw_value_bytes: [u8; 4],
 }
 
+/// # Errors
+/// Returns an error if the file is not a valid TIFF or cannot be read.
 pub fn read_tiff_header(file: &mut File) -> AnyResult<TiffHeader> {
     let mut header_bytes = [0u8; 8];
     file.read_exact(&mut header_bytes)?;
@@ -81,6 +83,8 @@ pub fn read_tiff_header(file: &mut File) -> AnyResult<TiffHeader> {
     })
 }
 
+/// # Errors
+/// Returns an error if the IFD cannot be read or is malformed.
 pub fn read_ifd(file: &mut File, little_endian: bool) -> AnyResult<Vec<IfdEntry>> {
     let mut entry_count_bytes = [0u8; 2];
     file.read_exact(&mut entry_count_bytes)?;
@@ -149,6 +153,8 @@ pub fn read_ifd(file: &mut File, little_endian: bool) -> AnyResult<Vec<IfdEntry>
     Ok(entries)
 }
 
+/// # Errors
+/// Returns an error if the entry values cannot be read or the field type is unsupported.
 pub fn read_entry_values_u32(
     file: &mut File,
     entry: &IfdEntry,
@@ -208,6 +214,8 @@ pub fn read_entry_values_u32(
     Ok(values)
 }
 
+/// # Errors
+/// Returns an error if the entry values cannot be read or the field type is not f64.
 pub fn read_entry_values_f64(
     file: &mut File,
     entry: &IfdEntry,
@@ -250,6 +258,8 @@ pub fn read_entry_values_f64(
     Ok(values)
 }
 
+/// # Errors
+/// Returns an error if the tag is not found or the value cannot be read.
 pub fn read_tag_u32(
     file: &mut File,
     entries: &[IfdEntry],
@@ -263,6 +273,8 @@ pub fn read_tag_u32(
         .ok_or_else(|| format!("Tag {tag} missing value").into())
 }
 
+/// # Errors
+/// Returns an error if the tag is not found or the values cannot be read.
 pub fn read_tag_u32_vec(
     file: &mut File,
     entries: &[IfdEntry],
@@ -273,6 +285,8 @@ pub fn read_tag_u32_vec(
     read_entry_values_u32(file, entry, little_endian)
 }
 
+/// # Errors
+/// Returns an error if the values cannot be read (but not if the tag is missing).
 pub fn read_tag_u32_vec_optional(
     file: &mut File,
     entries: &[IfdEntry],
@@ -285,6 +299,8 @@ pub fn read_tag_u32_vec_optional(
     })
 }
 
+/// # Errors
+/// Returns an error if the tag is not found or the string cannot be read.
 pub fn read_tag_string_from_ifd(
     file: &mut File,
     entries: &[IfdEntry],
@@ -328,6 +344,27 @@ fn get_entry(entries: &[IfdEntry], tag: u16) -> Option<&IfdEntry> {
     Some((min, max))
 }
 
+/// Parse AREA_OR_POINT from GDAL metadata XML
+/// Returns `true` if AREA_OR_POINT="Point" (pixel center registration)
+/// Returns `false` if AREA_OR_POINT="Area" or missing (pixel corner registration)
+#[must_use] pub fn parse_area_or_point(metadata: &str) -> bool {
+    extract_metadata_str(metadata, "AREA_OR_POINT")
+        .map(|s| s == "Point")
+        .unwrap_or(false)
+}
+
+fn extract_metadata_str(metadata: &str, key: &str) -> Option<String> {
+    let needle = format!("name=\"{key}\"");
+    let pos = metadata.find(&needle)?;
+    let rest = &metadata[pos..];
+    let start = rest.find('>')? + 1;
+    let rest = &rest[start..];
+    let end = rest.find('<')?;
+    Some(rest[..end].trim().to_string())
+}
+
+/// # Errors
+/// Returns an error if the file cannot be read or is not a valid TIFF.
 pub fn read_primary_compression(path: &Path) -> AnyResult<Option<u16>> {
     let mut file = File::open(path)?;
     let header = read_tiff_header(&mut file)?;
@@ -339,20 +376,23 @@ pub fn read_primary_compression(path: &Path) -> AnyResult<Option<u16>> {
         TAG_COMPRESSION,
         header.little_endian,
     ) {
+        // Cast is safe: compression values are small integers (typically < 100)
+        #[allow(clippy::cast_possible_truncation)]
         Ok(value) => Ok(Some(value as u16)),
         Err(_) => Ok(None),
     }
 }
 
+/// # Errors
+/// Returns an error if the tag values cannot be read (but not if the tag is missing).
 pub fn read_tag_f64_triplet(
     file: &mut File,
     entries: &[IfdEntry],
     tag: u16,
     little_endian: bool,
 ) -> AnyResult<Option<[f64; 3]>> {
-    let entry = match get_entry(entries, tag) {
-        Some(entry) => entry,
-        None => return Ok(None),
+    let Some(entry) = get_entry(entries, tag) else {
+        return Ok(None);
     };
 
     let values = read_entry_values_f64(file, entry, little_endian)?;
@@ -363,15 +403,16 @@ pub fn read_tag_f64_triplet(
     }
 }
 
+/// # Errors
+/// Returns an error if the tag values cannot be read (but not if the tag is missing).
 pub fn read_tag_f64_six(
     file: &mut File,
     entries: &[IfdEntry],
     tag: u16,
     little_endian: bool,
 ) -> AnyResult<Option<[f64; 6]>> {
-    let entry = match get_entry(entries, tag) {
-        Some(entry) => entry,
-        None => return Ok(None),
+    let Some(entry) = get_entry(entries, tag) else {
+        return Ok(None);
     };
 
     let values = read_entry_values_f64(file, entry, little_endian)?;

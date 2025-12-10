@@ -3,8 +3,8 @@
 //! This module provides S3-compatible storage access for reading COG files.
 //! It supports:
 //! - AWS S3
-//! - MinIO
-//! - Any S3-compatible storage (DigitalOcean Spaces, Backblaze B2, etc.)
+//! - `MinIO`
+//! - Any S3-compatible storage (`DigitalOcean` Spaces, Backblaze B2, etc.)
 //!
 //! # Configuration
 //!
@@ -13,7 +13,7 @@
 //! - `AWS_SECRET_ACCESS_KEY` - AWS secret key
 //! - `AWS_REGION` - AWS region (default: us-east-1)
 //! - `AWS_ENDPOINT_URL` - Custom endpoint for MinIO/S3-compatible services
-//! - `AWS_ALLOW_HTTP` - Set to "true" to allow HTTP endpoints (for local MinIO)
+//! - `AWS_ALLOW_HTTP` - Set to "true" to allow HTTP endpoints (for local `MinIO`)
 //!
 //! # Example
 //!
@@ -52,13 +52,13 @@ pub struct S3Config {
     pub key: String,
     /// AWS region (default: us-east-1)
     pub region: Option<String>,
-    /// Custom endpoint URL (for MinIO, LocalStack, etc.)
+    /// Custom endpoint URL (for `MinIO`, `LocalStack`, etc.)
     pub endpoint_url: Option<String>,
     /// AWS access key ID
     pub access_key_id: Option<String>,
     /// AWS secret access key
     pub secret_access_key: Option<String>,
-    /// Allow HTTP connections (required for local MinIO without TLS)
+    /// Allow HTTP connections (required for local `MinIO` without TLS)
     pub allow_http: bool,
     /// Skip signature verification (for anonymous access to public buckets)
     pub skip_signature: bool,
@@ -68,6 +68,9 @@ impl S3Config {
     /// Create a new S3 config from an S3 URL
     ///
     /// Parses URLs like `s3://bucket/key/path`
+    ///
+    /// # Errors
+    /// Returns an error if the URL is invalid, missing bucket/key, or not using the s3:// scheme.
     pub fn from_url(url: &str) -> AnyResult<Self> {
         let parsed = url::Url::parse(url)?;
 
@@ -102,7 +105,8 @@ impl S3Config {
         })
     }
 
-    /// Create a config for MinIO with default local settings
+    /// Create a config for `MinIO` with default local settings
+    #[must_use] 
     pub fn for_minio(bucket: &str, key: &str, endpoint: &str) -> Self {
         Self {
             bucket: bucket.to_string(),
@@ -139,12 +143,18 @@ impl S3RangeReaderAsync {
     /// # Ok(())
     /// # }
     /// ```
+    ///
+    /// # Errors
+    /// Returns an error if the URL is invalid or the S3 object cannot be accessed.
     pub async fn new(url: &str) -> AnyResult<Self> {
         let config = S3Config::from_url(url)?;
         Self::from_config(config).await
     }
 
     /// Create a new S3 range reader from a config
+    ///
+    /// # Errors
+    /// Returns an error if the S3 configuration is invalid or the object cannot be accessed.
     pub async fn from_config(config: S3Config) -> AnyResult<Self> {
         let mut builder = AmazonS3Builder::new()
             .with_bucket_name(&config.bucket);
@@ -191,6 +201,9 @@ impl S3RangeReaderAsync {
     }
 
     /// Read a range of bytes asynchronously
+    ///
+    /// # Errors
+    /// Returns an error if the S3 read operation fails due to network issues or invalid ranges.
     pub async fn read_range_async(&self, offset: u64, length: usize) -> AnyResult<Vec<u8>> {
         let range = Range {
             start: offset,
@@ -208,17 +221,19 @@ impl S3RangeReaderAsync {
     }
 
     /// Get the file size
+    #[must_use] 
     pub fn size(&self) -> u64 {
         self.size
     }
 
     /// Get the S3 URL
+    #[must_use] 
     pub fn url(&self) -> &str {
         &self.url
     }
 }
 
-/// Synchronous wrapper for S3RangeReaderAsync that implements RangeReader trait
+/// Synchronous wrapper for `S3RangeReaderAsync` that implements `RangeReader` trait
 pub struct S3RangeReaderSync {
     inner: S3RangeReaderAsync,
     runtime: Handle,
@@ -228,6 +243,9 @@ impl S3RangeReaderSync {
     /// Create a new sync S3 range reader
     ///
     /// Must be called from within a tokio runtime context
+    ///
+    /// # Errors
+    /// Returns an error if not called from within a tokio runtime or if the S3 object cannot be accessed.
     pub fn new(url: &str) -> AnyResult<Self> {
         let runtime = Handle::try_current()
             .map_err(|_| "S3RangeReaderSync must be created within a tokio runtime")?;
@@ -238,6 +256,9 @@ impl S3RangeReaderSync {
     }
 
     /// Create from an existing async reader
+    ///
+    /// # Errors
+    /// Returns an error if not called from within a tokio runtime.
     pub fn from_async(inner: S3RangeReaderAsync) -> AnyResult<Self> {
         let runtime = Handle::try_current()
             .map_err(|_| "S3RangeReaderSync must be created within a tokio runtime")?;
